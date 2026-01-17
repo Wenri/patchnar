@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
+#include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <map>
@@ -28,6 +29,11 @@ static std::string oldGlibcPath;
 static std::string oldGccLibPath;
 static bool debugMode = false;
 
+// Hash mappings for inter-package reference substitution
+// Maps old store path basename to new store path basename
+// e.g., "abc123...-bash-5.2" -> "xyz789...-bash-5.2"
+static std::map<std::string, std::string> hashMappings;
+
 static void debug(const char* format, ...)
 {
     if (debugMode) {
@@ -35,6 +41,68 @@ static void debug(const char* format, ...)
         va_start(ap, format);
         vfprintf(stderr, format, ap);
         va_end(ap);
+    }
+}
+
+// Load hash mappings from file
+// Format: one mapping per line: "/nix/store/old-hash-name /nix/store/new-hash-name"
+static void loadMappings(const std::string& filename)
+{
+    std::ifstream file(filename);
+    if (!file) {
+        std::cerr << "patchnar: warning: cannot open mappings file: " << filename << "\n";
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+
+        size_t space = line.find(' ');
+        if (space == std::string::npos) continue;
+
+        std::string oldPath = line.substr(0, space);
+        std::string newPath = line.substr(space + 1);
+
+        // Extract basename (everything after last /)
+        auto oldBase = oldPath.substr(oldPath.rfind('/') + 1);
+        auto newBase = newPath.substr(newPath.rfind('/') + 1);
+
+        // Validate same length (required for safe substitution in NAR)
+        if (oldBase.length() == newBase.length()) {
+            hashMappings[oldBase] = newBase;
+            debug("  mapping: %s -> %s\n", oldBase.c_str(), newBase.c_str());
+        } else {
+            std::cerr << "patchnar: warning: skipping mapping " << oldBase
+                      << " -> " << newBase << " (length mismatch: "
+                      << oldBase.length() << " vs " << newBase.length() << ")\n";
+        }
+    }
+
+    debug("patchnar: loaded %zu hash mappings\n", hashMappings.size());
+}
+
+// Apply hash mappings to content (text substitution, like sed)
+// This replaces old store path basenames with new ones
+static void applyHashMappings(std::vector<unsigned char>& content)
+{
+    if (hashMappings.empty()) return;
+
+    // Convert to string for easier manipulation
+    std::string str(content.begin(), content.end());
+    bool modified = false;
+
+    for (const auto& [oldHash, newHash] : hashMappings) {
+        size_t pos = 0;
+        while ((pos = str.find(oldHash, pos)) != std::string::npos) {
+            str.replace(pos, oldHash.length(), newHash);
+            pos += newHash.length();
+            modified = true;
+        }
+    }
+
+    if (modified) {
+        content.assign(str.begin(), str.end());
     }
 }
 
@@ -79,35 +147,64 @@ static std::string replaceAll(const std::string& str,
     return result;
 }
 
+// Apply hash mappings to a string (for symlinks, etc.)
+static std::string applyHashMappingsToString(const std::string& str)
+{
+    if (hashMappings.empty()) return str;
+
+    std::string result = str;
+    for (const auto& [oldHash, newHash] : hashMappings) {
+        size_t pos = 0;
+        while ((pos = result.find(oldHash, pos)) != std::string::npos) {
+            result.replace(pos, oldHash.length(), newHash);
+            pos += newHash.length();
+        }
+    }
+    return result;
+}
+
 // Patch symlink target
 static std::string patchSymlink(const std::string& target)
 {
-    // Add prefix to /nix/store paths
-    if (target.rfind("/nix/store/", 0) == 0) {
-        std::string newTarget = prefix + target;
-        debug("  symlink: %s -> %s\n", target.c_str(), newTarget.c_str());
-        return newTarget;
+    std::string newTarget = target;
+
+    // First apply hash mappings for inter-package references
+    newTarget = applyHashMappingsToString(newTarget);
+
+    // Then add prefix to /nix/store paths
+    if (newTarget.rfind("/nix/store/", 0) == 0) {
+        newTarget = prefix + newTarget;
     }
-    return target;
+
+    if (newTarget != target) {
+        debug("  symlink: %s -> %s\n", target.c_str(), newTarget.c_str());
+    }
+    return newTarget;
 }
 
 // Transform a single RPATH entry
 static std::string transformRpathEntry(const std::string& entry)
 {
+    std::string result = entry;
+
+    // First apply hash mappings for inter-package references
+    result = applyHashMappingsToString(result);
+
     // Replace old glibc with new glibc
-    if (!oldGlibcPath.empty() && entry.find(oldGlibcPath) != std::string::npos) {
-        return replaceAll(entry, oldGlibcPath, glibcPath);
+    if (!oldGlibcPath.empty() && result.find(oldGlibcPath) != std::string::npos) {
+        result = replaceAll(result, oldGlibcPath, glibcPath);
     }
     // Replace old gcc-lib with new gcc-lib
-    if (!oldGccLibPath.empty() && entry.find(oldGccLibPath) != std::string::npos) {
-        return replaceAll(entry, oldGccLibPath, gccLibPath);
+    if (!oldGccLibPath.empty() && result.find(oldGccLibPath) != std::string::npos) {
+        result = replaceAll(result, oldGccLibPath, gccLibPath);
     }
-    // Add prefix to other /nix/store paths
-    if (entry.rfind("/nix/store/", 0) == 0) {
-        return prefix + entry;
+
+    // Add prefix to /nix/store paths (for Android glibc and other libs)
+    if (result.rfind("/nix/store/", 0) == 0) {
+        result = prefix + result;
     }
-    // Keep non-nix paths unchanged
-    return entry;
+
+    return result;
 }
 
 // Build new RPATH from old RPATH by transforming each entry
@@ -166,13 +263,17 @@ static std::vector<unsigned char> patchElfContent(
         if (!interp.empty()) {
             std::string newInterp = interp;
 
+            // First apply hash mappings for inter-package references
+            newInterp = applyHashMappingsToString(newInterp);
+
             // Replace old glibc interpreter
-            if (!oldGlibcPath.empty() && interp.find(oldGlibcPath) != std::string::npos) {
-                newInterp = replaceAll(interp, oldGlibcPath, glibcPath);
+            if (!oldGlibcPath.empty() && newInterp.find(oldGlibcPath) != std::string::npos) {
+                newInterp = replaceAll(newInterp, oldGlibcPath, glibcPath);
             }
-            // Add prefix to other interpreters
-            else if (interp.rfind("/nix/store/", 0) == 0) {
-                newInterp = prefix + interp;
+
+            // Add prefix to /nix/store interpreters (needed for kernel to find ld.so)
+            if (newInterp.rfind("/nix/store/", 0) == 0) {
+                newInterp = prefix + newInterp;
             }
 
             if (newInterp != interp) {
@@ -259,21 +360,29 @@ static std::vector<unsigned char> patchContent(
     const std::vector<unsigned char>& content,
     bool executable)
 {
+    std::vector<unsigned char> result;
+
     if (isElf(content)) {
         debug("  patching ELF (%zu bytes)\n", content.size());
         if (isElf32(content)) {
-            return patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(
+            result = patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(
                 std::vector<unsigned char>(content), executable);
         } else {
-            return patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
+            result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
                 std::vector<unsigned char>(content), executable);
         }
     } else if (isScript(content)) {
         debug("  patching script (%zu bytes)\n", content.size());
-        return patchScript(std::vector<unsigned char>(content));
+        result = patchScript(std::vector<unsigned char>(content));
+    } else {
+        result = content;
     }
 
-    return content;
+    // Apply hash mappings for inter-package references
+    // This must be done AFTER ELF/script patching to not interfere with structure
+    applyHashMappings(result);
+
+    return result;
 }
 
 static void showHelp(const char* progName)
@@ -289,6 +398,8 @@ static void showHelp(const char* progName)
               << "  --gcc-lib PATH       Android gcc-lib store path\n"
               << "  --old-glibc PATH     Original glibc store path to replace\n"
               << "  --old-gcc-lib PATH   Original gcc-lib store path to replace\n"
+              << "  --mappings FILE      Hash mappings file for inter-package refs\n"
+              << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -301,13 +412,14 @@ int main(int argc, char** argv)
         {"gcc-lib",     required_argument, nullptr, 'c'},
         {"old-glibc",   required_argument, nullptr, 'G'},
         {"old-gcc-lib", required_argument, nullptr, 'C'},
+        {"mappings",    required_argument, nullptr, 'm'},
         {"debug",       no_argument,       nullptr, 'd'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr,       0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:c:G:C:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:c:G:C:m:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -323,6 +435,9 @@ int main(int argc, char** argv)
             break;
         case 'C':
             oldGccLibPath = optarg;
+            break;
+        case 'm':
+            loadMappings(optarg);
             break;
         case 'd':
             debugMode = true;
