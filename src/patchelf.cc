@@ -1759,6 +1759,39 @@ void ElfFile<ElfFileParamNames>::modifyRPath(RPathOp op,
 
 
 template<ElfFileParams>
+std::string ElfFile<ElfFileParamNames>::getRPath() const
+{
+    auto shdrDynamic = tryFindSectionHeader(".dynamic");
+    if (!shdrDynamic)
+        return "";
+
+    if (rdi(shdrDynamic->get().sh_type) == SHT_NOBITS)
+        return "";
+
+    auto shdrDynStr = tryFindSectionHeader(".dynstr");
+    if (!shdrDynStr)
+        return "";
+
+    const char * strTab = (const char *) fileContents->data() + rdi(shdrDynStr->get().sh_offset);
+
+    const char * rpath = nullptr;
+    auto dyn = (const Elf_Dyn *)(fileContents->data() + rdi(shdrDynamic->get().sh_offset));
+    for ( ; rdi(dyn->d_tag) != DT_NULL; dyn++) {
+        if (rdi(dyn->d_tag) == DT_RPATH) {
+            /* Only use DT_RPATH if there is no DT_RUNPATH. */
+            if (!rpath)
+                rpath = strTab + rdi(dyn->d_un.d_val);
+        }
+        else if (rdi(dyn->d_tag) == DT_RUNPATH) {
+            rpath = strTab + rdi(dyn->d_un.d_val);
+        }
+    }
+
+    return rpath ? std::string(rpath) : "";
+}
+
+
+template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::removeNeeded(const std::set<std::string> & libs)
 {
     if (libs.empty()) return;

@@ -91,6 +91,53 @@ static std::string patchSymlink(const std::string& target)
     return target;
 }
 
+// Transform a single RPATH entry
+static std::string transformRpathEntry(const std::string& entry)
+{
+    // Replace old glibc with new glibc
+    if (!oldGlibcPath.empty() && entry.find(oldGlibcPath) != std::string::npos) {
+        return replaceAll(entry, oldGlibcPath, glibcPath);
+    }
+    // Replace old gcc-lib with new gcc-lib
+    if (!oldGccLibPath.empty() && entry.find(oldGccLibPath) != std::string::npos) {
+        return replaceAll(entry, oldGccLibPath, gccLibPath);
+    }
+    // Add prefix to other /nix/store paths
+    if (entry.rfind("/nix/store/", 0) == 0) {
+        return prefix + entry;
+    }
+    // Keep non-nix paths unchanged
+    return entry;
+}
+
+// Build new RPATH from old RPATH by transforming each entry
+static std::string buildNewRpath(const std::string& oldRpath)
+{
+    if (oldRpath.empty()) {
+        return "";
+    }
+
+    std::string newRpath;
+    std::string current;
+
+    for (size_t i = 0; i <= oldRpath.size(); ++i) {
+        if (i == oldRpath.size() || oldRpath[i] == ':') {
+            if (!current.empty()) {
+                std::string transformed = transformRpathEntry(current);
+                if (!newRpath.empty()) {
+                    newRpath += ':';
+                }
+                newRpath += transformed;
+            }
+            current.clear();
+        } else {
+            current += oldRpath[i];
+        }
+    }
+
+    return newRpath;
+}
+
 // Forward declarations for ELF patching (defined in patchelf.cc)
 template<ElfFileParams>
 class ElfFile;
@@ -135,25 +182,12 @@ static std::vector<unsigned char> patchElfContent(
         }
 
         // Patch RPATH/RUNPATH
-        // First, read current rpath by printing it
-        // For now, we'll use rpSet to set new rpath
-        // TODO: Get current rpath and transform it
-        std::string currentRpath;
         try {
-            // This is a workaround - modifyRPath with rpPrint outputs to stdout
-            // We need a way to get the current rpath programmatically
-            // For now, we'll set a new rpath based on glibc/gcc-lib paths
-            if (!glibcPath.empty() || !gccLibPath.empty()) {
-                std::string newRpath;
-                if (!glibcPath.empty()) {
-                    newRpath = glibcPath + "/lib";
-                }
-                if (!gccLibPath.empty()) {
-                    if (!newRpath.empty()) newRpath += ":";
-                    newRpath += gccLibPath + "/lib";
-                }
-                // Don't set empty rpath
-                if (!newRpath.empty()) {
+            std::string currentRpath = elfFile.getRPath();
+            if (!currentRpath.empty()) {
+                std::string newRpath = buildNewRpath(currentRpath);
+                if (newRpath != currentRpath) {
+                    debug("  rpath: %s -> %s\n", currentRpath.c_str(), newRpath.c_str());
                     elfFile.modifyRPath(ElfFileType::rpSet, {}, newRpath);
                 }
             }

@@ -153,6 +153,7 @@ public:
     typedef enum { rpPrint, rpShrink, rpSet, rpAdd, rpRemove } RPathOp;
 
     void modifyRPath(RPathOp op, const std::vector<std::string> & allowedRpathPrefixes, std::string newRPath);
+    [[nodiscard]] std::string getRPath() const;
     std::string shrinkRPath(char* rpath, std::vector<std::string> &neededLibs, const std::vector<std::string> & allowedRpathPrefixes);
     void removeRPath(Elf_Shdr & shdrDynamic);
 
