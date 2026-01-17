@@ -187,17 +187,20 @@ static std::string transformRpathEntry(const std::string& entry)
 {
     std::string result = entry;
 
-    // First apply hash mappings for inter-package references
-    result = applyHashMappingsToString(result);
+    // IMPORTANT: glibc/gcc-lib substitution MUST happen BEFORE hash mappings
+    // because hash mappings would change the path and prevent matching
 
-    // Replace old glibc with new glibc
+    // Replace old glibc with new glibc (Android glibc)
     if (!oldGlibcPath.empty() && result.find(oldGlibcPath) != std::string::npos) {
         result = replaceAll(result, oldGlibcPath, glibcPath);
     }
-    // Replace old gcc-lib with new gcc-lib
+    // Replace old gcc-lib with new gcc-lib (Android gcc-lib)
     if (!oldGccLibPath.empty() && result.find(oldGccLibPath) != std::string::npos) {
         result = replaceAll(result, oldGccLibPath, gccLibPath);
     }
+
+    // Then apply hash mappings for inter-package references
+    result = applyHashMappingsToString(result);
 
     // Add prefix to /nix/store paths (for Android glibc and other libs)
     if (result.rfind("/nix/store/", 0) == 0) {
@@ -263,13 +266,16 @@ static std::vector<unsigned char> patchElfContent(
         if (!interp.empty()) {
             std::string newInterp = interp;
 
-            // First apply hash mappings for inter-package references
-            newInterp = applyHashMappingsToString(newInterp);
+            // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
+            // because hash mappings would change the path and prevent matching
 
-            // Replace old glibc interpreter
+            // Replace old glibc interpreter with Android glibc
             if (!oldGlibcPath.empty() && newInterp.find(oldGlibcPath) != std::string::npos) {
                 newInterp = replaceAll(newInterp, oldGlibcPath, glibcPath);
             }
+
+            // Then apply hash mappings for inter-package references
+            newInterp = applyHashMappingsToString(newInterp);
 
             // Add prefix to /nix/store interpreters (needed for kernel to find ld.so)
             if (newInterp.rfind("/nix/store/", 0) == 0) {
