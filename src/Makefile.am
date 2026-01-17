@@ -17,6 +17,10 @@ AM_CXXFLAGS += $(SAN_FLAGS)
 endif
 endif
 
-bin_PROGRAMS = patchelf
+bin_PROGRAMS = patchelf patchnar
 
 patchelf_SOURCES = patchelf.cc elf.h patchelf.h
+
+# patchnar uses patchelf as library (PATCHELF_AS_LIBRARY excludes main)
+patchnar_SOURCES = patchnar.cc nar.cc nar.h patchelf.cc elf.h patchelf.h
+patchnar_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY

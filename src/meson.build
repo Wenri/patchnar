@@ -9,10 +9,25 @@ endif
 
 config_h = configure_file(output : 'config.h', configuration : confdata)
 
+# Common sources for patchelf functionality
+patchelf_sources = ['patchelf.cc', 'patchelf.h']
+
 executable(
   'patchelf',
-  [ 'patchelf.cc', 'patchelf.h', config_h ],
+  [ patchelf_sources, config_h ],
   include_directories : include_directories('.'),
   cpp_args : [ '-include', meson.current_build_dir() / 'config.h' ],
+  install : true,
+)
+
+# patchnar - NAR stream patcher for Android
+executable(
+  'patchnar',
+  [ 'patchnar.cc', 'nar.cc', 'nar.h', patchelf_sources, config_h ],
+  include_directories : include_directories('.'),
+  cpp_args : [
+    '-include', meson.current_build_dir() / 'config.h',
+    '-DPATCHELF_AS_LIBRARY',  # Exclude patchelf's main()
+  ],
   install : true,
 )
