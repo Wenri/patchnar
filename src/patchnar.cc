@@ -24,9 +24,7 @@
 // Configuration
 static std::string prefix;
 static std::string glibcPath;
-static std::string gccLibPath;
 static std::string oldGlibcPath;
-static std::string oldGccLibPath;
 static bool debugMode = false;
 
 // Hash mappings for inter-package reference substitution
@@ -187,19 +185,16 @@ static std::string transformRpathEntry(const std::string& entry)
 {
     std::string result = entry;
 
-    // IMPORTANT: glibc/gcc-lib substitution MUST happen BEFORE hash mappings
+    // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
     // because hash mappings would change the path and prevent matching
+    // gcc-lib is handled by hash mapping (same package, different hash)
 
     // Replace old glibc with new glibc (Android glibc)
     if (!oldGlibcPath.empty() && result.find(oldGlibcPath) != std::string::npos) {
         result = replaceAll(result, oldGlibcPath, glibcPath);
     }
-    // Replace old gcc-lib with new gcc-lib (Android gcc-lib)
-    if (!oldGccLibPath.empty() && result.find(oldGccLibPath) != std::string::npos) {
-        result = replaceAll(result, oldGccLibPath, gccLibPath);
-    }
 
-    // Then apply hash mappings for inter-package references
+    // Then apply hash mappings for inter-package references (including gcc-lib)
     result = applyHashMappingsToString(result);
 
     // Add prefix to /nix/store paths (for Android glibc and other libs)
@@ -325,14 +320,14 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
 
     // Check if shebang contains /nix/store
     if (shebang.find("/nix/store/") != std::string::npos) {
-        // Replace old glibc paths
+        // Replace old glibc paths (gcc-lib handled by hash mapping)
         std::string newShebang = shebang;
         if (!oldGlibcPath.empty()) {
             newShebang = replaceAll(newShebang, oldGlibcPath, glibcPath);
         }
-        if (!oldGccLibPath.empty()) {
-            newShebang = replaceAll(newShebang, oldGccLibPath, gccLibPath);
-        }
+
+        // Apply hash mappings for inter-package references
+        newShebang = applyHashMappingsToString(newShebang);
 
         // Add prefix to remaining /nix/store paths
         // Look for /nix/store/ after #!
@@ -401,9 +396,7 @@ static void showHelp(const char* progName)
               << "Options:\n"
               << "  --prefix PATH        Installation prefix (e.g., /data/.../usr)\n"
               << "  --glibc PATH         Android glibc store path\n"
-              << "  --gcc-lib PATH       Android gcc-lib store path\n"
               << "  --old-glibc PATH     Original glibc store path to replace\n"
-              << "  --old-gcc-lib PATH   Original gcc-lib store path to replace\n"
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --debug              Enable debug output\n"
@@ -415,9 +408,7 @@ int main(int argc, char** argv)
     static struct option longOptions[] = {
         {"prefix",      required_argument, nullptr, 'p'},
         {"glibc",       required_argument, nullptr, 'g'},
-        {"gcc-lib",     required_argument, nullptr, 'c'},
         {"old-glibc",   required_argument, nullptr, 'G'},
-        {"old-gcc-lib", required_argument, nullptr, 'C'},
         {"mappings",    required_argument, nullptr, 'm'},
         {"debug",       no_argument,       nullptr, 'd'},
         {"help",        no_argument,       nullptr, 'h'},
@@ -425,7 +416,7 @@ int main(int argc, char** argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:c:G:C:m:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -433,14 +424,8 @@ int main(int argc, char** argv)
         case 'g':
             glibcPath = optarg;
             break;
-        case 'c':
-            gccLibPath = optarg;
-            break;
         case 'G':
             oldGlibcPath = optarg;
-            break;
-        case 'C':
-            oldGccLibPath = optarg;
             break;
         case 'm':
             loadMappings(optarg);
@@ -465,9 +450,7 @@ int main(int argc, char** argv)
 
     debug("patchnar: prefix=%s\n", prefix.c_str());
     debug("patchnar: glibc=%s\n", glibcPath.c_str());
-    debug("patchnar: gcc-lib=%s\n", gccLibPath.c_str());
     debug("patchnar: old-glibc=%s\n", oldGlibcPath.c_str());
-    debug("patchnar: old-gcc-lib=%s\n", oldGccLibPath.c_str());
 
     try {
         // Set stdin/stdout to binary mode
