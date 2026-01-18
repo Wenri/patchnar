@@ -42,6 +42,25 @@ static void debug(const char* format, ...)
     }
 }
 
+// Add a single hash mapping from full store paths
+// Extracts basenames and validates length match
+static void addMapping(const std::string& oldPath, const std::string& newPath)
+{
+    // Extract basename (everything after last /)
+    auto oldBase = oldPath.substr(oldPath.rfind('/') + 1);
+    auto newBase = newPath.substr(newPath.rfind('/') + 1);
+
+    // Validate same length (required for safe substitution in NAR)
+    if (oldBase.length() == newBase.length()) {
+        hashMappings[oldBase] = newBase;
+        debug("  mapping: %s -> %s\n", oldBase.c_str(), newBase.c_str());
+    } else {
+        std::cerr << "patchnar: warning: skipping mapping " << oldBase
+                  << " -> " << newBase << " (length mismatch: "
+                  << oldBase.length() << " vs " << newBase.length() << ")\n";
+    }
+}
+
 // Load hash mappings from file
 // Format: one mapping per line: "/nix/store/old-hash-name /nix/store/new-hash-name"
 static void loadMappings(const std::string& filename)
@@ -61,20 +80,7 @@ static void loadMappings(const std::string& filename)
 
         std::string oldPath = line.substr(0, space);
         std::string newPath = line.substr(space + 1);
-
-        // Extract basename (everything after last /)
-        auto oldBase = oldPath.substr(oldPath.rfind('/') + 1);
-        auto newBase = newPath.substr(newPath.rfind('/') + 1);
-
-        // Validate same length (required for safe substitution in NAR)
-        if (oldBase.length() == newBase.length()) {
-            hashMappings[oldBase] = newBase;
-            debug("  mapping: %s -> %s\n", oldBase.c_str(), newBase.c_str());
-        } else {
-            std::cerr << "patchnar: warning: skipping mapping " << oldBase
-                      << " -> " << newBase << " (length mismatch: "
-                      << oldBase.length() << " vs " << newBase.length() << ")\n";
-        }
+        addMapping(oldPath, newPath);
     }
 
     debug("patchnar: loaded %zu hash mappings\n", hashMappings.size());
@@ -399,6 +405,7 @@ static void showHelp(const char* progName)
               << "  --old-glibc PATH     Original glibc store path to replace\n"
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
+              << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -406,17 +413,18 @@ static void showHelp(const char* progName)
 int main(int argc, char** argv)
 {
     static struct option longOptions[] = {
-        {"prefix",      required_argument, nullptr, 'p'},
-        {"glibc",       required_argument, nullptr, 'g'},
-        {"old-glibc",   required_argument, nullptr, 'G'},
-        {"mappings",    required_argument, nullptr, 'm'},
-        {"debug",       no_argument,       nullptr, 'd'},
-        {"help",        no_argument,       nullptr, 'h'},
-        {nullptr,       0,                 nullptr, 0}
+        {"prefix",       required_argument, nullptr, 'p'},
+        {"glibc",        required_argument, nullptr, 'g'},
+        {"old-glibc",    required_argument, nullptr, 'G'},
+        {"mappings",     required_argument, nullptr, 'm'},
+        {"self-mapping", required_argument, nullptr, 's'},
+        {"debug",        no_argument,       nullptr, 'd'},
+        {"help",         no_argument,       nullptr, 'h'},
+        {nullptr,        0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -430,6 +438,21 @@ int main(int argc, char** argv)
         case 'm':
             loadMappings(optarg);
             break;
+        case 's': {
+            // Parse "OLD_PATH NEW_PATH" format
+            std::string arg = optarg;
+            size_t space = arg.find(' ');
+            if (space != std::string::npos) {
+                std::string oldPath = arg.substr(0, space);
+                std::string newPath = arg.substr(space + 1);
+                addMapping(oldPath, newPath);
+                debug("patchnar: self-mapping: %s -> %s\n", oldPath.c_str(), newPath.c_str());
+            } else {
+                std::cerr << "patchnar: error: --self-mapping requires \"OLD_PATH NEW_PATH\" format\n";
+                return 1;
+            }
+            break;
+        }
         case 'd':
             debugMode = true;
             break;
