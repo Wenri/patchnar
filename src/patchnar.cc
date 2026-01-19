@@ -172,10 +172,17 @@ static std::string patchSymlink(const std::string& target)
 {
     std::string newTarget = target;
 
-    // First apply hash mappings for inter-package references
+    // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
+    // This is the same order as transformRpathEntry to ensure consistency
+    // Replace old glibc with Android glibc (for symlinks like ld.so)
+    if (!oldGlibcPath.empty() && newTarget.find(oldGlibcPath) != std::string::npos) {
+        newTarget = replaceAll(newTarget, oldGlibcPath, glibcPath);
+    }
+
+    // Then apply hash mappings for inter-package references
     newTarget = applyHashMappingsToString(newTarget);
 
-    // Then add prefix to /nix/store paths
+    // Finally add prefix to /nix/store paths
     if (newTarget.rfind("/nix/store/", 0) == 0) {
         newTarget = prefix + newTarget;
     }
