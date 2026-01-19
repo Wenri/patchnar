@@ -175,8 +175,19 @@ static std::string patchSymlink(const std::string& target)
     // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
     // This is the same order as transformRpathEntry to ensure consistency
     // Replace old glibc with Android glibc (for symlinks like ld.so)
-    if (!oldGlibcPath.empty() && newTarget.find(oldGlibcPath) != std::string::npos) {
-        newTarget = replaceAll(newTarget, oldGlibcPath, glibcPath);
+    if (!oldGlibcPath.empty()) {
+        // Try full path first (for absolute symlinks)
+        if (newTarget.find(oldGlibcPath) != std::string::npos) {
+            newTarget = replaceAll(newTarget, oldGlibcPath, glibcPath);
+        } else {
+            // For relative symlinks (e.g., ../../hash-glibc-version/lib/...)
+            // Extract basenames and try to match those
+            auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
+            auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
+            if (!oldBase.empty() && newTarget.find(oldBase) != std::string::npos) {
+                newTarget = replaceAll(newTarget, oldBase, newBase);
+            }
+        }
     }
 
     // Then apply hash mappings for inter-package references
