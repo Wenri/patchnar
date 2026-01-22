@@ -18,6 +18,15 @@ AC_PROG_CXX
 AC_LANG([C++])
 AM_PROG_AS
 
+# Check for pkg-config
+PKG_PROG_PKG_CONFIG
+
+# Check for source-highlight library (required for patchnar script tokenization)
+PKG_CHECK_MODULES([SOURCE_HIGHLIGHT], [source-highlight >= 3.0],
+    [AC_DEFINE([HAVE_SOURCE_HIGHLIGHT], [1], [Define if source-highlight is available])],
+    [AC_MSG_WARN([source-highlight not found - script string patching will be disabled])])
+AM_CONDITIONAL([HAVE_SOURCE_HIGHLIGHT], [test "x$SOURCE_HIGHLIGHT_CFLAGS" != "x"])
+
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],
    AS_HELP_STRING([--with-page-size=SIZE], [Specify default pagesize (default auto)]),

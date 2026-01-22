@@ -5,6 +5,10 @@
  * and writes the modified NAR to stdout.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include "nar.h"
 #include "elf.h"
 #include "patchelf.h"
@@ -16,16 +20,66 @@
 #include <getopt.h>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Source-highlight includes for shell tokenization (optional)
+#ifdef HAVE_SOURCE_HIGHLIGHT
+#include <srchilite/sourcehighlighter.h>
+#include <srchilite/formattermanager.h>
+#include <srchilite/formatter.h>
+#include <srchilite/formatterparams.h>
+#include <srchilite/langdefmanager.h>
+#include <srchilite/regexrulefactory.h>
+#include <boost/shared_ptr.hpp>
+#include <boost/make_shared.hpp>
+#endif
 
 // Configuration
 static std::string prefix;
 static std::string glibcPath;
 static std::string oldGlibcPath;
 static bool debugMode = false;
+
+// Additional paths to prefix in script strings (e.g., "/nix/var/")
+static std::vector<std::string> addPrefixToPaths;
+// Path to source-highlight data directory (for .lang files)
+static std::string sourceHighlightDataDir;
+
+// String region representing a string literal in source code
+struct StringRegion {
+    size_t start;  // Starting position in the content
+    size_t end;    // Ending position in the content
+};
+
+#ifdef HAVE_SOURCE_HIGHLIGHT
+// Custom formatter that captures string literal positions during source-highlight processing
+// This formatter is registered for the "string" element type only
+class StringCapture : public srchilite::Formatter {
+public:
+    std::vector<StringRegion>& regions;
+    size_t lineOffset;  // Offset of current line in the overall content
+
+    StringCapture(std::vector<StringRegion>& r) : regions(r), lineOffset(0) {}
+
+    void format(const std::string& s, const srchilite::FormatterParams* params) override {
+        if (params && params->start >= 0) {
+            size_t start = lineOffset + static_cast<size_t>(params->start);
+            regions.push_back({start, start + s.length()});
+        }
+    }
+};
+
+// Null formatter that discards everything (for non-string elements)
+class NullFormatter : public srchilite::Formatter {
+public:
+    void format(const std::string&, const srchilite::FormatterParams*) override {}
+};
+#endif // HAVE_SOURCE_HIGHLIGHT
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -40,6 +94,87 @@ static void debug(const char* format, ...)
         vfprintf(stderr, format, ap);
         va_end(ap);
     }
+}
+
+// Get string literal regions in a shell script using source-highlight
+// Returns empty vector if source-highlight is not available or fails
+static std::vector<StringRegion> getShellStringRegions(const std::string& content)
+{
+    std::vector<StringRegion> regions;
+
+#ifdef HAVE_SOURCE_HIGHLIGHT
+    if (sourceHighlightDataDir.empty()) {
+        debug("  source-highlight data dir not set, skipping string detection\n");
+        return regions;
+    }
+
+    try {
+        // Initialize language definition manager with regex rule factory
+        srchilite::RegexRuleFactory ruleFactory;
+        srchilite::LangDefManager langDefManager(&ruleFactory);
+
+        // Get the highlight state for shell scripts
+        srchilite::SourceHighlighter highlighter(
+            langDefManager.getHighlightState(sourceHighlightDataDir, "sh.lang"));
+
+        // Disable optimization to get accurate position information
+        highlighter.setOptimize(false);
+
+        // Create formatters (source-highlight uses boost::shared_ptr)
+        auto stringCapture = boost::make_shared<StringCapture>(regions);
+        auto nullFormatter = boost::make_shared<NullFormatter>();
+
+        // Create formatter manager with null default formatter
+        srchilite::FormatterManager formatterManager(nullFormatter);
+
+        // Register string formatter - only captures string literals
+        formatterManager.addFormatter("string", stringCapture);
+
+        highlighter.setFormatterManager(&formatterManager);
+
+        // Set up position tracking
+        srchilite::FormatterParams params;
+        highlighter.setFormatterParams(&params);
+
+        // Process each line
+        std::istringstream stream(content);
+        std::string line;
+        size_t lineOffset = 0;
+
+        while (std::getline(stream, line)) {
+            // Update formatter with current line offset
+            stringCapture->lineOffset = lineOffset;
+            params.start = 0;
+
+            highlighter.highlightParagraph(line);
+
+            // Move to next line (+1 for newline character)
+            lineOffset += line.length() + 1;
+        }
+
+        debug("  found %zu string regions\n", regions.size());
+
+    } catch (const std::exception& e) {
+        debug("  source-highlight failed: %s, falling back to shebang-only\n", e.what());
+        regions.clear();
+    }
+#else
+    (void)content;  // Suppress unused parameter warning
+    debug("  source-highlight not available, skipping string detection\n");
+#endif // HAVE_SOURCE_HIGHLIGHT
+
+    return regions;
+}
+
+// Check if a position is inside any string region
+static bool isInsideString(size_t pos, const std::vector<StringRegion>& regions)
+{
+    for (const auto& region : regions) {
+        if (pos >= region.start && pos < region.end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Add a single hash mapping from full store paths
@@ -331,16 +466,20 @@ static std::vector<unsigned char> patchElfContent(
     }
 }
 
-// Patch script shebang
+// Patch script shebang and string literals
 static std::vector<unsigned char> patchScript(std::vector<unsigned char> content)
 {
-    // Find end of first line
-    size_t lineEnd = 0;
-    while (lineEnd < content.size() && content[lineEnd] != '\n') {
-        lineEnd++;
-    }
+    if (prefix.empty()) return content;
 
-    std::string shebang(content.begin(), content.begin() + lineEnd);
+    std::string str(content.begin(), content.end());
+    bool modified = false;
+
+    // Find end of first line (shebang)
+    size_t shebangEnd = str.find('\n');
+    if (shebangEnd == std::string::npos) shebangEnd = str.size();
+
+    // === SHEBANG PATCHING ===
+    std::string shebang = str.substr(0, shebangEnd);
 
     // Check if shebang contains /nix/store
     if (shebang.find("/nix/store/") != std::string::npos) {
@@ -368,15 +507,60 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
 
         if (newShebang != shebang) {
             debug("  shebang: %s -> %s\n", shebang.c_str(), newShebang.c_str());
-
-            std::vector<unsigned char> result;
-            result.reserve(content.size() + newShebang.size() - shebang.size());
-            result.insert(result.end(), newShebang.begin(), newShebang.end());
-            result.insert(result.end(), content.begin() + lineEnd, content.end());
-            return result;
+            str.replace(0, shebangEnd, newShebang);
+            // Adjust shebangEnd for the size difference
+            shebangEnd += (newShebang.length() - shebang.length());
+            modified = true;
         }
     }
 
+    // === STRING-AWARE CONTENT PATCHING ===
+    // Patch additional paths (like /nix/var/) only inside string literals
+    if (!addPrefixToPaths.empty()) {
+        // Get string regions using source-highlight
+        std::vector<StringRegion> stringRegions = getShellStringRegions(str);
+
+        if (!stringRegions.empty()) {
+            debug("  patching additional paths in %zu string regions\n", stringRegions.size());
+
+            for (const auto& pattern : addPrefixToPaths) {
+                size_t pos = shebangEnd;  // Skip shebang line
+                while ((pos = str.find(pattern, pos)) != std::string::npos) {
+                    // Only patch if inside a string literal
+                    if (isInsideString(pos, stringRegions)) {
+                        // Check not already prefixed
+                        bool alreadyPrefixed = (pos >= prefix.length() &&
+                            str.substr(pos - prefix.length(), prefix.length()) == prefix);
+
+                        if (!alreadyPrefixed) {
+                            debug("  patching %s at position %zu (inside string)\n",
+                                  pattern.c_str(), pos);
+                            str.insert(pos, prefix);
+
+                            // Adjust all subsequent regions for the insertion
+                            for (auto& region : stringRegions) {
+                                if (region.start > pos) {
+                                    region.start += prefix.length();
+                                }
+                                if (region.end > pos) {
+                                    region.end += prefix.length();
+                                }
+                            }
+                            pos += prefix.length();
+                            modified = true;
+                        }
+                    }
+                    pos += pattern.length();
+                }
+            }
+        } else if (!sourceHighlightDataDir.empty()) {
+            debug("  no string regions found, skipping additional path patching\n");
+        }
+    }
+
+    if (modified) {
+        return std::vector<unsigned char>(str.begin(), str.end());
+    }
     return content;
 }
 
@@ -424,6 +608,10 @@ static void showHelp(const char* progName)
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
+              << "  --add-prefix-to PATH Path pattern to add prefix to in script strings\n"
+              << "                       (e.g., /nix/var/). Can be specified multiple times.\n"
+              << "  --source-highlight-data-dir DIR\n"
+              << "                       Path to source-highlight data files (.lang files)\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -431,18 +619,20 @@ static void showHelp(const char* progName)
 int main(int argc, char** argv)
 {
     static struct option longOptions[] = {
-        {"prefix",       required_argument, nullptr, 'p'},
-        {"glibc",        required_argument, nullptr, 'g'},
-        {"old-glibc",    required_argument, nullptr, 'G'},
-        {"mappings",     required_argument, nullptr, 'm'},
-        {"self-mapping", required_argument, nullptr, 's'},
-        {"debug",        no_argument,       nullptr, 'd'},
-        {"help",         no_argument,       nullptr, 'h'},
-        {nullptr,        0,                 nullptr, 0}
+        {"prefix",                   required_argument, nullptr, 'p'},
+        {"glibc",                    required_argument, nullptr, 'g'},
+        {"old-glibc",                required_argument, nullptr, 'G'},
+        {"mappings",                 required_argument, nullptr, 'm'},
+        {"self-mapping",             required_argument, nullptr, 's'},
+        {"add-prefix-to",            required_argument, nullptr, 'A'},
+        {"source-highlight-data-dir", required_argument, nullptr, 'D'},
+        {"debug",                    no_argument,       nullptr, 'd'},
+        {"help",                     no_argument,       nullptr, 'h'},
+        {nullptr,                    0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -471,6 +661,12 @@ int main(int argc, char** argv)
             }
             break;
         }
+        case 'A':
+            addPrefixToPaths.push_back(optarg);
+            break;
+        case 'D':
+            sourceHighlightDataDir = optarg;
+            break;
         case 'd':
             debugMode = true;
             break;
@@ -492,6 +688,10 @@ int main(int argc, char** argv)
     debug("patchnar: prefix=%s\n", prefix.c_str());
     debug("patchnar: glibc=%s\n", glibcPath.c_str());
     debug("patchnar: old-glibc=%s\n", oldGlibcPath.c_str());
+    debug("patchnar: source-highlight-data-dir=%s\n", sourceHighlightDataDir.c_str());
+    for (const auto& path : addPrefixToPaths) {
+        debug("patchnar: add-prefix-to=%s\n", path.c_str());
+    }
 
     try {
         // Set stdin/stdout to binary mode
