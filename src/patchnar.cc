@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-// Source-highlight includes for shell tokenization (optional)
+// Source-highlight includes for string literal tokenization (optional)
 #ifdef HAVE_SOURCE_HIGHLIGHT
 #include <srchilite/sourcehighlighter.h>
 #include <srchilite/formattermanager.h>
@@ -35,6 +35,7 @@
 #include <srchilite/formatterparams.h>
 #include <srchilite/langdefmanager.h>
 #include <srchilite/regexrulefactory.h>
+#include <srchilite/langmap.h>
 #include <boost/shared_ptr.hpp>
 #include <boost/make_shared.hpp>
 #endif
@@ -96,9 +97,10 @@ static void debug(const char* format, ...)
     }
 }
 
-// Get string literal regions in a shell script using source-highlight
+// Get string literal regions in source code using source-highlight
+// Uses LangMap to auto-detect language from filename
 // Returns empty vector if source-highlight is not available or fails
-static std::vector<StringRegion> getShellStringRegions(const std::string& content)
+static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& filename)
 {
     std::vector<StringRegion> regions;
 
@@ -109,13 +111,24 @@ static std::vector<StringRegion> getShellStringRegions(const std::string& conten
     }
 
     try {
+        // Use LangMap to detect the language from filename
+        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
+        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
+
+        if (langFile.empty()) {
+            debug("  no language detected for %s\n", filename.c_str());
+            return regions;
+        }
+
+        debug("  detected language: %s for %s\n", langFile.c_str(), filename.c_str());
+
         // Initialize language definition manager with regex rule factory
         srchilite::RegexRuleFactory ruleFactory;
         srchilite::LangDefManager langDefManager(&ruleFactory);
 
-        // Get the highlight state for shell scripts
+        // Get the highlight state for the detected language
         srchilite::SourceHighlighter highlighter(
-            langDefManager.getHighlightState(sourceHighlightDataDir, "sh.lang"));
+            langDefManager.getHighlightState(sourceHighlightDataDir, langFile));
 
         // Disable optimization to get accurate position information
         highlighter.setOptimize(false);
@@ -155,11 +168,12 @@ static std::vector<StringRegion> getShellStringRegions(const std::string& conten
         debug("  found %zu string regions\n", regions.size());
 
     } catch (const std::exception& e) {
-        debug("  source-highlight failed: %s, falling back to shebang-only\n", e.what());
+        debug("  source-highlight failed: %s\n", e.what());
         regions.clear();
     }
 #else
-    (void)content;  // Suppress unused parameter warning
+    (void)content;   // Suppress unused parameter warning
+    (void)filename;  // Suppress unused parameter warning
     debug("  source-highlight not available, skipping string detection\n");
 #endif // HAVE_SOURCE_HIGHLIGHT
 
@@ -466,8 +480,9 @@ static std::vector<unsigned char> patchElfContent(
     }
 }
 
-// Patch script shebang and string literals
-static std::vector<unsigned char> patchScript(std::vector<unsigned char> content)
+// Patch script shebang and string literals in source files
+// The filename is used to auto-detect the language for string literal detection
+static std::vector<unsigned char> patchScript(std::vector<unsigned char> content, const std::string& filename)
 {
     if (prefix.empty()) return content;
 
@@ -516,9 +531,10 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
 
     // === STRING-AWARE CONTENT PATCHING ===
     // Patch additional paths (like /nix/var/) only inside string literals
-    if (!addPrefixToPaths.empty()) {
-        // Get string regions using source-highlight
-        std::vector<StringRegion> stringRegions = getShellStringRegions(str);
+    // Uses source-highlight with auto-detected language based on filename
+    if (!addPrefixToPaths.empty() && !filename.empty()) {
+        // Get string regions using source-highlight with auto language detection
+        std::vector<StringRegion> stringRegions = getStringRegions(str, filename);
 
         if (!stringRegions.empty()) {
             debug("  patching additional paths in %zu string regions\n", stringRegions.size());
@@ -554,7 +570,7 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
                 }
             }
         } else if (!sourceHighlightDataDir.empty()) {
-            debug("  no string regions found, skipping additional path patching\n");
+            debug("  no string regions found for %s, skipping additional path patching\n", filename.c_str());
         }
     }
 
@@ -565,14 +581,25 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
 }
 
 // Main content patcher
+// The path parameter is the relative path within the NAR (e.g., "bin/bash", "share/nix/nix.sh")
 static std::vector<unsigned char> patchContent(
     const std::vector<unsigned char>& content,
-    bool executable)
+    bool executable,
+    const std::string& path)
 {
     std::vector<unsigned char> result;
 
+    // Extract filename from path for language detection
+    std::string filename;
+    size_t lastSlash = path.rfind('/');
+    if (lastSlash != std::string::npos) {
+        filename = path.substr(lastSlash + 1);
+    } else {
+        filename = path;
+    }
+
     if (isElf(content)) {
-        debug("  patching ELF (%zu bytes)\n", content.size());
+        debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
         if (isElf32(content)) {
             result = patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(
                 std::vector<unsigned char>(content), executable);
@@ -581,10 +608,17 @@ static std::vector<unsigned char> patchContent(
                 std::vector<unsigned char>(content), executable);
         }
     } else if (isScript(content)) {
-        debug("  patching script (%zu bytes)\n", content.size());
-        result = patchScript(std::vector<unsigned char>(content));
+        debug("  patching script %s (%zu bytes)\n", path.c_str(), content.size());
+        result = patchScript(std::vector<unsigned char>(content), filename);
     } else {
-        result = content;
+        // For non-ELF, non-script files, still try string-aware patching
+        // if source-highlight can detect the language from the filename
+        if (!addPrefixToPaths.empty() && !filename.empty() && !sourceHighlightDataDir.empty()) {
+            debug("  checking source file %s (%zu bytes)\n", path.c_str(), content.size());
+            result = patchScript(std::vector<unsigned char>(content), filename);
+        } else {
+            result = content;
+        }
     }
 
     // Apply hash mappings for inter-package references

@@ -27,8 +27,9 @@ enum class EntryType {
 };
 
 // Callback types for streaming processing
+// ContentPatcher receives: content, executable flag, and relative path within NAR
 using ContentPatcher = std::function<std::vector<unsigned char>(
-    const std::vector<unsigned char>& content, bool executable)>;
+    const std::vector<unsigned char>& content, bool executable, const std::string& path)>;
 using SymlinkPatcher = std::function<std::string(const std::string& target)>;
 
 // NAR processor - reads NAR, applies patches, writes NAR
@@ -55,10 +56,10 @@ private:
     void writeString(const std::vector<unsigned char>& s);
 
     // NAR structure processing
-    void processNode();
-    void processRegular();
+    void processNode(const std::string& path);
+    void processRegular(const std::string& path);
     void processSymlink();
-    void processDirectory();
+    void processDirectory(const std::string& path);
 
     std::istream& in_;
     std::ostream& out_;

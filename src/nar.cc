@@ -95,12 +95,13 @@ void NarProcessor::process()
     expectString(NAR_MAGIC);
     writeString(NAR_MAGIC);
 
-    processNode();
+    // Root node has empty path
+    processNode("");
 
     out_.flush();
 }
 
-void NarProcessor::processNode()
+void NarProcessor::processNode(const std::string& path)
 {
     expectString("(");
     writeString("(");
@@ -112,11 +113,11 @@ void NarProcessor::processNode()
     writeString(nodeType);
 
     if (nodeType == "regular") {
-        processRegular();
+        processRegular(path);
     } else if (nodeType == "symlink") {
         processSymlink();
     } else if (nodeType == "directory") {
-        processDirectory();
+        processDirectory(path);
         // processDirectory already handled the closing ")"
         return;
     } else {
@@ -127,7 +128,7 @@ void NarProcessor::processNode()
     writeString(")");
 }
 
-void NarProcessor::processRegular()
+void NarProcessor::processRegular(const std::string& path)
 {
     std::string marker = readString();
     bool executable = false;
@@ -164,7 +165,7 @@ void NarProcessor::processRegular()
     // Patch content if patcher is set
     std::vector<unsigned char> patched;
     if (contentPatcher_) {
-        patched = contentPatcher_(content, executable);
+        patched = contentPatcher_(content, executable, path);
     } else {
         patched = std::move(content);
     }
@@ -192,7 +193,7 @@ void NarProcessor::processSymlink()
     writeString(patched);
 }
 
-void NarProcessor::processDirectory()
+void NarProcessor::processDirectory(const std::string& path)
 {
     while (true) {
         std::string marker = readString();
@@ -221,7 +222,9 @@ void NarProcessor::processDirectory()
         expectString("node");
         writeString("node");
 
-        processNode();
+        // Build child path: parent/name (or just name for root entries)
+        std::string childPath = path.empty() ? name : path + "/" + name;
+        processNode(childPath);
 
         expectString(")");
         writeString(")");
