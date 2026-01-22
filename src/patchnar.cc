@@ -22,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -60,6 +61,8 @@ static unsigned int getThreadCount() {
 static std::vector<std::string> addPrefixToPaths;
 // Path to source-highlight data directory (for .lang files)
 static std::string sourceHighlightDataDir;
+// Mutex for source-highlight access (library is not thread-safe)
+static std::mutex sourceHighlightMutex;
 
 // String region representing a string literal in source code
 struct StringRegion {
@@ -108,11 +111,15 @@ static void debug(const char* format, ...)
 // Detect language from filename and/or content using source-highlight
 // Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
 // Detection priority: 1) Filename-based (LangMap) 2) Content-based (LanguageInfer)
+// Thread-safe: uses mutex to protect source-highlight access
 static std::string detectLanguage(const std::string& filename, const std::string& content)
 {
     if (sourceHighlightDataDir.empty()) {
         return "";
     }
+
+    // Lock for thread safety - source-highlight is not thread-safe
+    std::lock_guard<std::mutex> lock(sourceHighlightMutex);
 
     try {
         srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
@@ -150,6 +157,7 @@ static std::string detectLanguage(const std::string& filename, const std::string
 // Get string literal regions in source code using source-highlight
 // Takes the .lang file directly (already detected by detectLanguage)
 // Returns empty vector if language is not set or processing fails
+// Thread-safe: uses mutex to protect source-highlight access
 static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile)
 {
     std::vector<StringRegion> regions;
@@ -157,6 +165,9 @@ static std::vector<StringRegion> getStringRegions(const std::string& content, co
     if (sourceHighlightDataDir.empty() || langFile.empty()) {
         return regions;
     }
+
+    // Lock for thread safety - source-highlight is not thread-safe
+    std::lock_guard<std::mutex> lock(sourceHighlightMutex);
 
     try {
         debug("  tokenizing with %s\n", langFile.c_str());
