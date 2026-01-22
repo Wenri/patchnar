@@ -21,11 +21,10 @@ AM_PROG_AS
 # Check for pkg-config
 PKG_PROG_PKG_CONFIG
 
-# Check for source-highlight library (required for patchnar script tokenization)
+# Check for source-highlight library (required for patchnar language detection)
 PKG_CHECK_MODULES([SOURCE_HIGHLIGHT], [source-highlight >= 3.0],
-    [AC_DEFINE([HAVE_SOURCE_HIGHLIGHT], [1], [Define if source-highlight is available])],
-    [AC_MSG_WARN([source-highlight not found - script string patching will be disabled])])
-AM_CONDITIONAL([HAVE_SOURCE_HIGHLIGHT], [test "x$SOURCE_HIGHLIGHT_CFLAGS" != "x"])
+    [],
+    [AC_MSG_ERROR([source-highlight >= 3.0 is required for language detection])])
 
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],

@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <getopt.h>
 #include <iostream>
 #include <map>
@@ -25,10 +26,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
-// Source-highlight includes for string literal tokenization (optional)
-#ifdef HAVE_SOURCE_HIGHLIGHT
+// Source-highlight includes for string literal tokenization (required)
 #include <srchilite/sourcehighlighter.h>
 #include <srchilite/formattermanager.h>
 #include <srchilite/formatter.h>
@@ -36,15 +37,24 @@
 #include <srchilite/langdefmanager.h>
 #include <srchilite/regexrulefactory.h>
 #include <srchilite/langmap.h>
+#include <srchilite/languageinfer.h>
 #include <boost/shared_ptr.hpp>
 #include <boost/make_shared.hpp>
-#endif
 
 // Configuration
 static std::string prefix;
 static std::string glibcPath;
 static std::string oldGlibcPath;
 static bool debugMode = false;
+static unsigned int numThreads = 0;  // 0 = auto-detect
+
+// Get actual thread count for parallel processing
+static unsigned int getThreadCount() {
+    if (numThreads == 0) {
+        return std::max(1u, std::thread::hardware_concurrency());
+    }
+    return numThreads;
+}
 
 // Additional paths to prefix in script strings (e.g., "/nix/var/")
 static std::vector<std::string> addPrefixToPaths;
@@ -57,7 +67,6 @@ struct StringRegion {
     size_t end;    // Ending position in the content
 };
 
-#ifdef HAVE_SOURCE_HIGHLIGHT
 // Custom formatter that captures string literal positions during source-highlight processing
 // This formatter is registered for the "string" element type only
 class StringCapture : public srchilite::Formatter {
@@ -80,7 +89,6 @@ class NullFormatter : public srchilite::Formatter {
 public:
     void format(const std::string&, const srchilite::FormatterParams*) override {}
 };
-#endif // HAVE_SOURCE_HIGHLIGHT
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -97,30 +105,61 @@ static void debug(const char* format, ...)
     }
 }
 
+// Detect language from filename and/or content using source-highlight
+// Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
+// Detection priority: 1) Filename-based (LangMap) 2) Content-based (LanguageInfer)
+static std::string detectLanguage(const std::string& filename, const std::string& content)
+{
+    if (sourceHighlightDataDir.empty()) {
+        return "";
+    }
+
+    try {
+        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
+
+        // 1. Try filename-based detection first
+        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
+        if (!langFile.empty()) {
+            debug("  detected language from filename: %s -> %s\n",
+                  filename.c_str(), langFile.c_str());
+            return langFile;
+        }
+
+        // 2. Try content-based detection (shebang, emacs mode, xml, etc.)
+        srchilite::LanguageInfer languageInfer;
+        std::istringstream contentStream(content);
+        std::string inferredLang = languageInfer.infer(contentStream);
+
+        if (!inferredLang.empty()) {
+            langFile = langMap.getMappedFileName(inferredLang);
+            if (!langFile.empty()) {
+                debug("  detected language from content: %s -> %s\n",
+                      inferredLang.c_str(), langFile.c_str());
+                return langFile;
+            }
+            debug("  inferred language '%s' but no mapping found\n", inferredLang.c_str());
+        }
+
+    } catch (const std::exception& e) {
+        debug("  language detection failed: %s\n", e.what());
+    }
+
+    return "";
+}
+
 // Get string literal regions in source code using source-highlight
-// Uses LangMap to auto-detect language from filename
-// Returns empty vector if source-highlight is not available or fails
-static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& filename)
+// Takes the .lang file directly (already detected by detectLanguage)
+// Returns empty vector if language is not set or processing fails
+static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile)
 {
     std::vector<StringRegion> regions;
 
-#ifdef HAVE_SOURCE_HIGHLIGHT
-    if (sourceHighlightDataDir.empty()) {
-        debug("  source-highlight data dir not set, skipping string detection\n");
+    if (sourceHighlightDataDir.empty() || langFile.empty()) {
         return regions;
     }
 
     try {
-        // Use LangMap to detect the language from filename
-        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
-        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
-
-        if (langFile.empty()) {
-            debug("  no language detected for %s\n", filename.c_str());
-            return regions;
-        }
-
-        debug("  detected language: %s for %s\n", langFile.c_str(), filename.c_str());
+        debug("  tokenizing with %s\n", langFile.c_str());
 
         // Initialize language definition manager with regex rule factory
         srchilite::RegexRuleFactory ruleFactory;
@@ -171,11 +210,6 @@ static std::vector<StringRegion> getStringRegions(const std::string& content, co
         debug("  source-highlight failed: %s\n", e.what());
         regions.clear();
     }
-#else
-    (void)content;   // Suppress unused parameter warning
-    (void)filename;  // Suppress unused parameter warning
-    debug("  source-highlight not available, skipping string detection\n");
-#endif // HAVE_SOURCE_HIGHLIGHT
 
     return regions;
 }
@@ -267,8 +301,9 @@ static bool isElf(const std::vector<unsigned char>& content)
     return memcmp(content.data(), ELFMAG, SELFMAG) == 0;
 }
 
-// Check if content is a script (starts with #!)
-static bool isScript(const std::vector<unsigned char>& content)
+// Check if content has a shebang (starts with #!)
+// Used only to determine if shebang patching should be applied
+static bool hasShebang(const std::vector<unsigned char>& content)
 {
     if (content.size() < 2)
         return false;
@@ -480,67 +515,75 @@ static std::vector<unsigned char> patchElfContent(
     }
 }
 
-// Patch script shebang and string literals in source files
-// The filename is used to auto-detect the language for string literal detection
-static std::vector<unsigned char> patchScript(std::vector<unsigned char> content, const std::string& filename)
+// Patch source file: shebang (if present) and string literals
+// The langFile is the detected .lang file (e.g., "sh.lang", "python.lang")
+static std::vector<unsigned char> patchSource(std::vector<unsigned char> content, const std::string& langFile)
 {
     if (prefix.empty()) return content;
 
     std::string str(content.begin(), content.end());
     bool modified = false;
-
-    // Find end of first line (shebang)
-    size_t shebangEnd = str.find('\n');
-    if (shebangEnd == std::string::npos) shebangEnd = str.size();
+    size_t contentStart = 0;  // Where string-aware patching starts
 
     // === SHEBANG PATCHING ===
-    std::string shebang = str.substr(0, shebangEnd);
+    // Only patch shebang if the file actually has one
+    if (hasShebang(content)) {
+        // Find end of first line (shebang)
+        size_t shebangEnd = str.find('\n');
+        if (shebangEnd == std::string::npos) shebangEnd = str.size();
 
-    // Check if shebang contains /nix/store
-    if (shebang.find("/nix/store/") != std::string::npos) {
-        // Replace old glibc paths (gcc-lib handled by hash mapping)
-        std::string newShebang = shebang;
-        if (!oldGlibcPath.empty()) {
-            newShebang = replaceAll(newShebang, oldGlibcPath, glibcPath);
-        }
+        std::string shebang = str.substr(0, shebangEnd);
 
-        // Apply hash mappings for inter-package references
-        newShebang = applyHashMappingsToString(newShebang);
-
-        // Add prefix to remaining /nix/store paths
-        // Look for /nix/store/ after #!
-        size_t pos = 2; // Skip #!
-        while ((pos = newShebang.find("/nix/store/", pos)) != std::string::npos) {
-            // Check if this is already prefixed
-            if (pos < prefix.length() ||
-                newShebang.substr(pos - prefix.length(), prefix.length()) != prefix) {
-                newShebang.insert(pos, prefix);
-                pos += prefix.length();
+        // Check if shebang contains /nix/store
+        if (shebang.find("/nix/store/") != std::string::npos) {
+            // Replace old glibc paths (gcc-lib handled by hash mapping)
+            std::string newShebang = shebang;
+            if (!oldGlibcPath.empty()) {
+                newShebang = replaceAll(newShebang, oldGlibcPath, glibcPath);
             }
-            pos += 11; // Skip "/nix/store/"
-        }
 
-        if (newShebang != shebang) {
-            debug("  shebang: %s -> %s\n", shebang.c_str(), newShebang.c_str());
-            str.replace(0, shebangEnd, newShebang);
-            // Adjust shebangEnd for the size difference
-            shebangEnd += (newShebang.length() - shebang.length());
-            modified = true;
+            // Apply hash mappings for inter-package references
+            newShebang = applyHashMappingsToString(newShebang);
+
+            // Add prefix to remaining /nix/store paths
+            // Look for /nix/store/ after #!
+            size_t pos = 2; // Skip #!
+            while ((pos = newShebang.find("/nix/store/", pos)) != std::string::npos) {
+                // Check if this is already prefixed
+                if (pos < prefix.length() ||
+                    newShebang.substr(pos - prefix.length(), prefix.length()) != prefix) {
+                    newShebang.insert(pos, prefix);
+                    pos += prefix.length();
+                }
+                pos += 11; // Skip "/nix/store/"
+            }
+
+            if (newShebang != shebang) {
+                debug("  shebang: %s -> %s\n", shebang.c_str(), newShebang.c_str());
+                str.replace(0, shebangEnd, newShebang);
+                // Adjust contentStart for the size difference
+                contentStart = shebangEnd + (newShebang.length() - shebang.length());
+                modified = true;
+            } else {
+                contentStart = shebangEnd;
+            }
+        } else {
+            contentStart = shebangEnd;
         }
     }
 
     // === STRING-AWARE CONTENT PATCHING ===
     // Patch additional paths (like /nix/var/) only inside string literals
-    // Uses source-highlight with auto-detected language based on filename
-    if (!addPrefixToPaths.empty() && !filename.empty()) {
-        // Get string regions using source-highlight with auto language detection
-        std::vector<StringRegion> stringRegions = getStringRegions(str, filename);
+    // Uses source-highlight with the pre-detected language
+    if (!addPrefixToPaths.empty() && !langFile.empty()) {
+        // Get string regions using source-highlight with the detected language
+        std::vector<StringRegion> stringRegions = getStringRegions(str, langFile);
 
         if (!stringRegions.empty()) {
             debug("  patching additional paths in %zu string regions\n", stringRegions.size());
 
             for (const auto& pattern : addPrefixToPaths) {
-                size_t pos = shebangEnd;  // Skip shebang line
+                size_t pos = contentStart;  // Skip shebang line if present
                 while ((pos = str.find(pattern, pos)) != std::string::npos) {
                     // Only patch if inside a string literal
                     if (isInsideString(pos, stringRegions)) {
@@ -570,7 +613,7 @@ static std::vector<unsigned char> patchScript(std::vector<unsigned char> content
                 }
             }
         } else if (!sourceHighlightDataDir.empty()) {
-            debug("  no string regions found for %s, skipping additional path patching\n", filename.c_str());
+            debug("  no string regions found, skipping additional path patching\n");
         }
     }
 
@@ -592,11 +635,7 @@ static std::vector<unsigned char> patchContent(
     // Extract filename from path for language detection
     std::string filename;
     size_t lastSlash = path.rfind('/');
-    if (lastSlash != std::string::npos) {
-        filename = path.substr(lastSlash + 1);
-    } else {
-        filename = path;
-    }
+    filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 
     if (isElf(content)) {
         debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
@@ -607,15 +646,15 @@ static std::vector<unsigned char> patchContent(
             result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
                 std::vector<unsigned char>(content), executable);
         }
-    } else if (isScript(content)) {
-        debug("  patching script %s (%zu bytes)\n", path.c_str(), content.size());
-        result = patchScript(std::vector<unsigned char>(content), filename);
     } else {
-        // For non-ELF, non-script files, still try string-aware patching
-        // if source-highlight can detect the language from the filename
-        if (!addPrefixToPaths.empty() && !filename.empty() && !sourceHighlightDataDir.empty()) {
-            debug("  checking source file %s (%zu bytes)\n", path.c_str(), content.size());
-            result = patchScript(std::vector<unsigned char>(content), filename);
+        // For all non-ELF files, try language detection
+        std::string contentStr(content.begin(), content.end());
+        std::string langFile = detectLanguage(filename, contentStr);
+
+        if (!langFile.empty()) {
+            debug("  patching source %s (%zu bytes, lang=%s)\n",
+                  path.c_str(), content.size(), langFile.c_str());
+            result = patchSource(std::vector<unsigned char>(content), langFile);
         } else {
             result = content;
         }
@@ -646,6 +685,7 @@ static void showHelp(const char* progName)
               << "                       (e.g., /nix/var/). Can be specified multiple times.\n"
               << "  --source-highlight-data-dir DIR\n"
               << "                       Path to source-highlight data files (.lang files)\n"
+              << "  --threads N, -j N    Number of worker threads (0 = auto, default: auto)\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -660,13 +700,14 @@ int main(int argc, char** argv)
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
         {"source-highlight-data-dir", required_argument, nullptr, 'D'},
+        {"threads",                  required_argument, nullptr, 'j'},
         {"debug",                    no_argument,       nullptr, 'd'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr,                    0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:j:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -701,6 +742,9 @@ int main(int argc, char** argv)
         case 'D':
             sourceHighlightDataDir = optarg;
             break;
+        case 'j':
+            numThreads = static_cast<unsigned int>(std::stoi(optarg));
+            break;
         case 'd':
             debugMode = true;
             break;
@@ -723,6 +767,7 @@ int main(int argc, char** argv)
     debug("patchnar: glibc=%s\n", glibcPath.c_str());
     debug("patchnar: old-glibc=%s\n", oldGlibcPath.c_str());
     debug("patchnar: source-highlight-data-dir=%s\n", sourceHighlightDataDir.c_str());
+    debug("patchnar: threads=%u (detected: %u)\n", numThreads, getThreadCount());
     for (const auto& path : addPrefixToPaths) {
         debug("patchnar: add-prefix-to=%s\n", path.c_str());
     }
@@ -734,6 +779,7 @@ int main(int argc, char** argv)
         nar::NarProcessor processor(std::cin, std::cout);
         processor.setContentPatcher(patchContent);
         processor.setSymlinkPatcher(patchSymlink);
+        processor.setNumThreads(getThreadCount());
         processor.process();
 
         return 0;

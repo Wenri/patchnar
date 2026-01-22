@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <istream>
 #include <ostream>
 #include <string>
@@ -32,6 +33,14 @@ using ContentPatcher = std::function<std::vector<unsigned char>(
     const std::vector<unsigned char>& content, bool executable, const std::string& path)>;
 using SymlinkPatcher = std::function<std::string(const std::string& target)>;
 
+// Pending file for batch processing
+struct PendingFile {
+    std::string path;
+    std::vector<unsigned char> content;
+    bool executable;
+    std::future<std::vector<unsigned char>> result;
+};
+
 // NAR processor - reads NAR, applies patches, writes NAR
 class NarProcessor {
 public:
@@ -40,6 +49,9 @@ public:
     // Set patchers
     void setContentPatcher(ContentPatcher patcher) { contentPatcher_ = std::move(patcher); }
     void setSymlinkPatcher(SymlinkPatcher patcher) { symlinkPatcher_ = std::move(patcher); }
+
+    // Set number of worker threads (0 = sequential processing)
+    void setNumThreads(unsigned int n) { numThreads_ = n; }
 
     // Process entire NAR stream
     void process();
@@ -65,6 +77,7 @@ private:
     std::ostream& out_;
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
+    unsigned int numThreads_ = 0;  // 0 = sequential processing
 };
 
 } // namespace nar

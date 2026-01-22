@@ -165,7 +165,21 @@ void NarProcessor::processRegular(const std::string& path)
     // Patch content if patcher is set
     std::vector<unsigned char> patched;
     if (contentPatcher_) {
-        patched = contentPatcher_(content, executable, path);
+        if (numThreads_ > 0) {
+            // Async patching - launch patch operation in background
+            // Note: we capture by value to avoid lifetime issues
+            auto futurePatched = std::async(std::launch::async,
+                [patcher = contentPatcher_, content = std::move(content), executable, path]() {
+                    return patcher(content, executable, path);
+                });
+
+            // Wait for result (NAR is sequential, must write in order)
+            // Future improvement: batch multiple files and write results in order
+            patched = futurePatched.get();
+        } else {
+            // Sequential patching
+            patched = contentPatcher_(content, executable, path);
+        }
     } else {
         patched = std::move(content);
     }
