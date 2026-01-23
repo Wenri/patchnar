@@ -33,21 +33,11 @@
       baseSrcFiles = [
         ./COPYING
         ./README.md
-        ./completions
-        ./patchelf.1
-        ./patchelf.spec.in
         (lib.fileset.difference ./src (
           lib.fileset.unions [
             ./src/Makefile.am
             ./src/CMakeLists.txt
             ./src/meson.build
-          ]
-        ))
-        (lib.fileset.difference ./tests (
-          lib.fileset.unions [
-            ./tests/Makefile.am
-            #./tests/CMakeLists.txt
-            #./tests/meson.build
           ]
         ))
         ./version
@@ -56,7 +46,6 @@
       autotoolsSrcFiles = [
         ./Makefile.am
         ./src/Makefile.am
-        ./tests/Makefile.am
         ./configure.ac
         ./m4
       ];
@@ -126,19 +115,6 @@
             echo "doc readme $out/README.md" >> $out/nix-support/hydra-build-products
           '';
         };
-
-        coverage =
-          (pkgs.releaseTools.coverageAnalysis {
-            name = "patchelf-coverage";
-            src = self.hydraJobs.tarball;
-            lcovFilter = [ "*/tests/*" ];
-          }).overrideAttrs
-            (old: {
-              preCheck = ''
-                # coverage cflag breaks this target
-                NIX_CFLAGS_COMPILE=''${NIX_CFLAGS_COMPILE//--coverage} make -C tests phdr-corruption.so
-              '';
-            });
 
         build = forAllSystems (system: self.packages.${system}.patchelf);
         build-sanitized = forAllSystems (
