@@ -1,133 +1,154 @@
-# PatchELF
+# patchnar
 
-PatchELF is a simple utility for modifying existing ELF executables and
-libraries.  In particular, it can do the following:
+A NAR (Nix ARchive) stream patcher for Android compatibility. Patches ELF binaries, symlinks, and shell scripts within NAR streams to work with Android's patched glibc.
 
-* Change the dynamic loader ("ELF interpreter") of executables:
+Based on [patchelf](https://github.com/NixOS/patchelf) and uses it as a library for ELF modifications.
 
-  ```console
-  $ patchelf --set-interpreter /lib/my-ld-linux.so.2 my-program
-  ```
+## Features
 
-* Change the `RPATH` of executables and libraries:
+- **Streaming NAR processing**: Reads NAR from stdin, writes patched NAR to stdout
+- **ELF patching**: Modifies interpreters and RPATH for Android glibc compatibility
+- **Symlink patching**: Adds installation prefix to `/nix/store/` symlink targets
+- **Script patching**: Uses GNU Source-highlight for string-aware shebang and path patching
+- **Hash mapping**: Substitutes store path hashes for inter-package reference updates
+- **Parallel processing**: TBB parallel_pipeline for concurrent patching with automatic backpressure
 
-  ```console
-  $ patchelf --set-rpath /opt/my-libs/lib:/other-libs my-program
-  ```
+## Architecture
 
-* Shrink the `RPATH` of executables and libraries:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TBB parallel_pipeline                        │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │ Parse NAR    │ -> │ Patch        │ -> │ Write NAR    │      │
+│  │ (serial)     │    │ (parallel)   │    │ (serial)     │      │
+│  └──────────────┘    └──────────────┘    └──────────────┘      │
+│                                                                 │
+│  8 tokens in flight for automatic backpressure                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-  ```console
-  $ patchelf --shrink-rpath my-program
-  ```
+## Usage
 
-  This removes from the `RPATH` all directories that do not contain a
-  library referenced by `DT_NEEDED` fields of the executable or library.
-  For instance, if an executable references one library `libfoo.so`, has
-  an RPATH `/lib:/usr/lib:/foo/lib`, and `libfoo.so` can only be found
-  in `/foo/lib`, then the new `RPATH` will be `/foo/lib`.
+```console
+$ patchnar [OPTIONS] < input.nar > output.nar
+```
 
-  In addition, the `--allowed-rpath-prefixes` option can be used for
-  further rpath tuning. For instance, if an executable has an `RPATH`
-  `/tmp/build-foo/.libs:/foo/lib`, it is probably desirable to keep
-  the `/foo/lib` reference instead of the `/tmp` entry. To accomplish
-  that, use:
+### Options
 
-  ```console
-  $ patchelf --shrink-rpath --allowed-rpath-prefixes /usr/lib:/foo/lib my-program
-  ```
+| Option | Description |
+|--------|-------------|
+| `--prefix PATH` | Installation prefix (e.g., `/data/data/com.termux.nix/files/usr`) |
+| `--glibc PATH` | Android glibc store path |
+| `--old-glibc PATH` | Original glibc store path to replace |
+| `--mappings FILE` | Hash mappings file (format: `OLD_PATH NEW_PATH` per line) |
+| `--self-mapping MAP` | Self-reference mapping (`OLD_PATH NEW_PATH`) |
+| `--add-prefix-to PATH` | Path pattern to prefix in scripts (e.g., `/nix/var/`). Repeatable. |
+| `--source-highlight-data-dir DIR` | Path to source-highlight `.lang` files |
+| `--debug` | Enable debug output |
 
-* Remove declared dependencies on dynamic libraries (`DT_NEEDED`
-  entries):
+### Example
 
-  ```console
-  $ patchelf --remove-needed libfoo.so.1 my-program
-  ```
+```console
+$ nix-store --dump /nix/store/abc123-hello | patchnar \
+    --prefix /data/data/com.termux.nix/files/usr \
+    --glibc /nix/store/xyz789-glibc-android-2.40 \
+    --old-glibc /nix/store/def456-glibc-2.40 \
+    --mappings hash-mappings.txt \
+    > patched-hello.nar
+```
 
-  This option can be given multiple times.
+### Environment Variables
 
-* Add a declared dependency on a dynamic library (`DT_NEEDED`):
+| Variable | Description |
+|----------|-------------|
+| `TBB_NUM_THREADS` | Control thread count for parallel patching |
 
-  ```console
-  $ patchelf --add-needed libfoo.so.1 my-program
-  ```
+## Building
 
-  This option can be give multiple times.
+Requires:
+- C++23 compiler (GCC 14+ or Clang 18+)
+- Intel TBB (onetbb >= 2020.0)
+- GNU Source-highlight (>= 3.0)
+- Boost (headers, for source-highlight)
 
-* Replace a declared dependency on a dynamic library with another one
-  (`DT_NEEDED`):
+### Via GNU Autotools
 
-  ```console
-  $ patchelf --replace-needed liboriginal.so.1 libreplacement.so.1 my-program
-  ```
-
-  This option can be give multiple times.
-
-* Change `SONAME` of a dynamic library:
-
-  ```console
-  $ patchelf --set-soname libnewname.so.3.4.5 path/to/libmylibrary.so.1.2.3
-  ```
-
-
-## Compiling and Testing
-
-### Via [GNU Autotools](https://www.gnu.org/software/automake/manual/html_node/Autotools-Introduction.html)
 ```console
 ./bootstrap.sh
 ./configure
 make
-make check
 sudo make install
 ```
 
-### Via [CMake](https://cmake.org/) (and [Ninja](https://ninja-build.org/))
+### Via CMake
 
 ```console
-mkdir build
-cd build
+mkdir build && cd build
 cmake .. -GNinja
-ninja all
+ninja
 sudo ninja install
 ```
 
-### Via [Meson](https://mesonbuild.com/) (and [Ninja](https://ninja-build.org/))
+### Via Meson
 
 ```console
-mkdir build
-meson configure build
-cd build
-ninja all
-sudo ninja install
+meson setup build
+meson compile -C build
+sudo meson install -C build
 ```
 
 ### Via Nix
 
-You can build with Nix in several ways.
+```console
+# Build patchnar
+nix build
 
-1. Building via `nix build` will produce the result in `./result/bin/patchelf`. If you would like to build _patchelf_ with _musl_ try `nix build .#patchelf-musl`
+# Build with specific build system
+nix build .#patchelf          # autotools (default)
+nix build .#patchelf-cmake    # CMake
+nix build .#patchelf-meson    # Meson
+```
 
-2. You can launch a development environment with `nix develop` and follow the autotools steps above. If you would like to develop with _musl_ try `nix develop .#musl`
+## How It Works
 
-## Help and resources
+### ELF Patching
 
-- Matrix: [#patchelf:nixos.org](https://matrix.to/#/#patchelf:nixos.org)
+For regular ELF files:
+1. Sets interpreter to `$PREFIX/nix/store/.../ld-linux.so`
+2. Modifies RPATH to include prefix and substitute glibc paths
+3. Applies hash mapping to update inter-package store references
 
-## Author
+### Symlink Patching
 
-Copyright 2004-2019 Eelco Dolstra <edolstra@gmail.com>.
+For symlinks pointing to `/nix/store/`:
+1. Adds installation prefix to target
+2. Applies hash mapping to update store path references
+
+### Script Patching
+
+For shell scripts (detected via shebang or `.sh` extension):
+1. Uses GNU Source-highlight to tokenize as shell script
+2. Only modifies paths inside string literals (preserves code structure)
+3. Adds prefix to `/nix/store/` and other configured paths
+4. Applies hash mapping to update store references
+
+## Integration with nix-on-droid
+
+patchnar is designed for [nix-on-droid](https://github.com/nix-community/nix-on-droid) to enable NixOS-style package grafting on Android:
+
+1. Build packages using standard nixpkgs binary cache
+2. At install time, patch NAR streams to use Android-compatible glibc
+3. Recursive dependency patching via hash mapping ensures all references are updated
 
 ## License
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or (at
-your option) any later version.
+GNU General Public License v3.0 or later.
 
-This program is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-General Public License for more details.
+Based on patchelf by Eelco Dolstra.
 
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
+## See Also
+
+- [patchelf](https://github.com/NixOS/patchelf) - The ELF patching library used internally
+- [nix-on-droid](https://github.com/nix-community/nix-on-droid) - Nix package manager on Android
+- [GNU Source-highlight](https://www.gnu.org/software/src-highlite/) - Used for script tokenization
