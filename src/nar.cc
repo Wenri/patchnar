@@ -2,19 +2,15 @@
  * NAR (Nix ARchive) format streaming implementation with C++23 coroutines
  *
  * Streaming architecture:
+ * - True streaming pipeline: parse() → patchedStream() → writeNode()
  * - Generator yields NarNode items as parsed (no tree allocation)
- * - Batch processor collects files, patches in parallel with std::execution::par
- * - Writes output immediately after each batch
- *
- * Thread count is controlled by TBB via TBB_NUM_THREADS environment variable.
+ * - Inline patching in patchedStream() - no batching needed
+ * - Memory: O(max_file) - only one file in memory at a time
  */
 
 #include "nar.h"
 
-#include <algorithm>
 #include <cstring>
-#include <execution>
-#include <functional>
 #include <stdexcept>
 
 namespace nar {
@@ -291,38 +287,19 @@ void NarProcessor::writeNode(const NarNode& node)
 }
 
 // ============================================================================
-// Batch Processing
+// Streaming Pipeline: parse() → patchedStream() → writeNode()
 // ============================================================================
 
-void NarProcessor::prepareBatch()
+std::generator<NarNode> NarProcessor::patchedStream()
 {
-    for (auto& node : batch_) {
-        node.contentPatcher_ = &contentPatcher_;
-        node.symlinkPatcher_ = &symlinkPatcher_;
+    for (NarNode node : parse()) {
+        if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
+            node.content = contentPatcher_(node.content, node.executable, node.path);
+        } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
+            node.target = symlinkPatcher_(node.target);
+        }
+        co_yield std::move(node);
     }
-}
-
-void NarProcessor::write()
-{
-    for (const auto& node : batch_) {
-        writeNode(node);
-    }
-    batch_.clear();
-}
-
-void NarProcessor::flushBatch()
-{
-    if (batch_.empty()) return;
-
-    // Prepare nodes with patcher pointers
-    prepareBatch();
-
-    // Patch all items in parallel using self-patching method
-    std::for_each(std::execution::par, begin(), end(),
-                  std::mem_fn(&NarNode::patch));
-
-    // Write in order (already sorted from input)
-    write();
 }
 
 // ============================================================================
@@ -333,27 +310,10 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    for (NarNode node : parse()) {
-        switch (node.type) {
-            case NarNode::Type::DirectoryStart:
-            case NarNode::Type::DirectoryEnd:
-            case NarNode::Type::EntryStart:
-                writeNode(node);
-                break;
-
-            case NarNode::Type::RegularFile:
-            case NarNode::Type::Symlink:
-                batch_.push_back(std::move(node));
-                break;
-
-            case NarNode::Type::EntryEnd:
-                flushBatch();  // Patch and write before closing entry
-                writeNode(node);
-                break;
-        }
+    for (const auto& node : patchedStream()) {
+        writeNode(node);
     }
 
-    flushBatch();  // Flush any remaining items (e.g., root is a single file)
     out_.flush();
 }
 

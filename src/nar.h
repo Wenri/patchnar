@@ -7,9 +7,10 @@
  * - Node: "(" type {regular|symlink|directory} ... ")"
  *
  * Processing architecture:
+ * - True streaming pipeline: parse() → patchedStream() → writeNode()
  * - Generator yields NarNode items as parsed (no tree in memory)
- * - Batch processor collects files, patches in parallel, writes immediately
- * - Memory: O(batch_size * max_file) instead of O(total_NAR_size)
+ * - Inline patching in patchedStream() - no batching needed
+ * - Memory: O(max_file) - only one file in memory at a time
  */
 
 #ifndef NAR_H
@@ -34,7 +35,7 @@ using ContentPatcher = std::function<std::vector<unsigned char>(
 using SymlinkPatcher = std::function<std::string(const std::string&)>;
 
 // ============================================================================
-// NarNode - Self-patching node yielded by the generator
+// NarNode - Data node yielded by the generator
 // ============================================================================
 
 struct NarNode {
@@ -50,24 +51,10 @@ struct NarNode {
     std::vector<unsigned char> content;  // File content (for RegularFile)
     std::string target;                  // Symlink target (for Symlink)
     bool executable = false;             // For RegularFile
-
-    // Patcher pointers (set by NarProcessor::prepareBatch before parallel execution)
-    // Non-owning const pointers to NarProcessor's std::function members
-    const ContentPatcher* contentPatcher_ = nullptr;
-    const SymlinkPatcher* symlinkPatcher_ = nullptr;
-
-    // Self-patching method (thread-safe, modifies only this instance)
-    void patch() {
-        if (type == Type::RegularFile && contentPatcher_ && *contentPatcher_) {
-            content = (*contentPatcher_)(content, executable, path);
-        } else if (type == Type::Symlink && symlinkPatcher_ && *symlinkPatcher_) {
-            target = (*symlinkPatcher_)(target);
-        }
-    }
 };
 
 // ============================================================================
-// NarProcessor - Streaming processor with parallel batch patching
+// NarProcessor - True streaming processor with inline patching
 // ============================================================================
 
 class NarProcessor {
@@ -77,20 +64,6 @@ public:
     void setContentPatcher(ContentPatcher patcher) { contentPatcher_ = std::move(patcher); }
     void setSymlinkPatcher(SymlinkPatcher patcher) { symlinkPatcher_ = std::move(patcher); }
     void process();
-
-    // Iterator interface for parallel patching
-    using iterator = std::vector<NarNode>::iterator;
-    using const_iterator = std::vector<NarNode>::const_iterator;
-    iterator begin() { return batch_.begin(); }
-    iterator end() { return batch_.end(); }
-    const_iterator begin() const { return batch_.begin(); }
-    const_iterator end() const { return batch_.end(); }
-
-    // Prepare batch for patching (sets patcher pointers on all nodes)
-    void prepareBatch();
-
-    // Write all nodes in batch to output
-    void write();
 
     struct Stats {
         size_t filesPatched = 0;
@@ -108,11 +81,11 @@ private:
     NarNode parseRegular(const std::string& path);
     NarNode parseSymlink(const std::string& path);
 
+    // Streaming pipeline: wraps parse() with inline patching
+    std::generator<NarNode> patchedStream();
+
     // Streaming write
     void writeNode(const NarNode& node);
-
-    // Batch processing
-    void flushBatch();
 
     // Low-level I/O
     void readExact(void* buf, size_t n);
@@ -129,7 +102,6 @@ private:
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
     Stats stats_;
-    std::vector<NarNode> batch_;
 };
 
 } // namespace nar
