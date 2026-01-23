@@ -111,6 +111,39 @@ static std::string sourceHighlightDataDir;
 // e.g., "abc123...-bash-5.2" -> "xyz789...-bash-5.2"
 static std::map<std::string, std::string> hashMappings;
 
+// Whitelist of language files worth tokenizing for string literal patching
+// These are languages where /nix/store paths commonly appear in string literals
+static const std::set<std::string> PATCHABLE_LANG_FILES = {
+    // Shell scripts (most common case)
+    "sh.lang",
+    "zsh.lang",
+
+    // Scripting languages
+    "python.lang",
+    "perl.lang",
+    "ruby.lang",
+    "lua.lang",
+    "tcl.lang",
+
+    // Web/JS (node scripts, configs)
+    "javascript.lang",
+    "json.lang",
+
+    // Config files
+    "conf.lang",
+    "desktop.lang",
+    "properties.lang",
+    "ini.lang",
+
+    // Build systems
+    "makefile.lang",
+    "m4.lang",
+
+    // Other
+    "xml.lang",
+    "awk.lang",
+};
+
 static void debug(const char* format, ...)
 {
     if (debugMode) {
@@ -675,11 +708,16 @@ static std::vector<unsigned char> patchContent(
             langFile = tokenizer->detectLanguage(filename, contentStr);
         }
 
-        if (!langFile.empty()) {
+        // Only process if language is in our whitelist of patchable languages
+        if (!langFile.empty() && PATCHABLE_LANG_FILES.count(langFile)) {
             debug("  patching source %s (%zu bytes, lang=%s)\n",
                   path.c_str(), content.size(), langFile.c_str());
             result = patchSource(std::vector<unsigned char>(content), langFile);
         } else {
+            if (!langFile.empty()) {
+                debug("  skipping %s (lang=%s not in whitelist)\n",
+                      path.c_str(), langFile.c_str());
+            }
             result = content;
         }
     }
