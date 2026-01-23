@@ -1,12 +1,12 @@
 /*
  * NAR (Nix ARchive) format implementation with parallel batch processing
  *
- * Two-phase processing architecture:
+ * Three-phase processing architecture:
  * 1. Parse entire NAR into in-memory tree (NarNode)
  * 2. Patch all regular files in parallel using std::execution::par
  * 3. Serialize patched tree back to NAR format
  *
- * Concurrency is controlled via Semaphore to limit parallel operations.
+ * Thread count is controlled by TBB via TBB_NUM_THREADS environment variable.
  */
 
 #include "nar.h"
@@ -14,8 +14,8 @@
 #include <algorithm>
 #include <cstring>
 #include <execution>
+#include <functional>
 #include <stdexcept>
-#include <thread>
 
 namespace nar {
 
@@ -133,14 +133,14 @@ void NarProcessor::writeBytes(const std::vector<unsigned char>& data)
 // Phase 1: Parse NAR into Tree
 // ============================================================================
 
-NarNodePtr NarProcessor::parseNode(const std::string& path)
+std::unique_ptr<NarNode> NarProcessor::parseNode(const std::string& path)
 {
     expectString("(");
     expectString("type");
 
     std::string nodeType = readString();
 
-    NarNodePtr node;
+    std::unique_ptr<NarNode> node;
     if (nodeType == "regular") {
         node = parseRegular(path);
         expectString(")");
@@ -157,7 +157,7 @@ NarNodePtr NarProcessor::parseNode(const std::string& path)
     return node;
 }
 
-NarNodePtr NarProcessor::parseRegular(const std::string& /*path*/)
+std::unique_ptr<NarNode> NarProcessor::parseRegular(const std::string& /*path*/)
 {
     auto regular = std::make_unique<NarNode>(NarRegular{});
     auto& reg = std::get<NarRegular>(*regular);
@@ -179,7 +179,7 @@ NarNodePtr NarProcessor::parseRegular(const std::string& /*path*/)
     return regular;
 }
 
-NarNodePtr NarProcessor::parseSymlink()
+std::unique_ptr<NarNode> NarProcessor::parseSymlink()
 {
     expectString("target");
     std::string target = readString();
@@ -188,7 +188,7 @@ NarNodePtr NarProcessor::parseSymlink()
     return std::make_unique<NarNode>(NarSymlink{std::move(target)});
 }
 
-NarNodePtr NarProcessor::parseDirectory(const std::string& path)
+std::unique_ptr<NarNode> NarProcessor::parseDirectory(const std::string& path)
 {
     auto directory = std::make_unique<NarNode>(NarDirectory{});
     auto& dir = std::get<NarDirectory>(*directory);
@@ -232,7 +232,7 @@ void NarProcessor::collectPatchTasks(
         using T = std::decay_t<decltype(n)>;
 
         if constexpr (std::is_same_v<T, NarRegular>) {
-            tasks.push_back({&n, path});
+            tasks.push_back({n, path, contentPatcher_});
         } else if constexpr (std::is_same_v<T, NarSymlink>) {
             // Symlinks are patched synchronously (fast operation)
             if (symlinkPatcher_) {
@@ -253,28 +253,10 @@ void NarProcessor::patchAllFiles(std::vector<PatchTask>& tasks)
         return;
     }
 
-    // Determine concurrency limit
-    unsigned int maxConcurrent = numThreads_;
-    if (maxConcurrent == 0) {
-        maxConcurrent = std::max(1u, std::thread::hardware_concurrency());
-    }
-
-    // Create semaphore to limit concurrent operations
-    Semaphore semaphore(maxConcurrent);
-
-    // Patch all files in parallel with concurrency control
+    // Patch all files in parallel
+    // Thread count controlled by TBB_NUM_THREADS environment variable
     std::for_each(std::execution::par, tasks.begin(), tasks.end(),
-        [this, &semaphore](PatchTask& task) {
-            // Acquire semaphore slot (blocks if at capacity)
-            SemaphoreGuard guard(semaphore);
-
-            // Patch the file
-            task.file->content = contentPatcher_(
-                task.file->content,
-                task.file->executable,
-                task.path
-            );
-        });
+        std::mem_fn(&PatchTask::operator()));
 }
 
 // ============================================================================
@@ -342,7 +324,7 @@ void NarProcessor::process()
 {
     // === Phase 1: Parse ===
     expectString(NAR_MAGIC);
-    NarNodePtr root = parseNode("");
+    std::unique_ptr<NarNode> root = parseNode("");
 
     // === Phase 2: Collect and Patch ===
     std::vector<PatchTask> tasks;

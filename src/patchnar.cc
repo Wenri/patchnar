@@ -17,7 +17,6 @@
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
-#include <future>
 #include <getopt.h>
 #include <iostream>
 #include <map>
@@ -27,7 +26,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 // Source-highlight includes for string literal tokenization (required)
@@ -47,15 +45,6 @@ static std::string prefix;
 static std::string glibcPath;
 static std::string oldGlibcPath;
 static bool debugMode = false;
-static unsigned int numThreads = 0;  // 0 = auto-detect
-
-// Get actual thread count for parallel processing
-static unsigned int getThreadCount() {
-    if (numThreads == 0) {
-        return std::max(1u, std::thread::hardware_concurrency());
-    }
-    return numThreads;
-}
 
 // Additional paths to prefix in script strings (e.g., "/nix/var/")
 static std::vector<std::string> addPrefixToPaths;
@@ -720,9 +709,10 @@ static void showHelp(const char* progName)
               << "                       (e.g., /nix/var/). Can be specified multiple times.\n"
               << "  --source-highlight-data-dir DIR\n"
               << "                       Path to source-highlight data files (.lang files)\n"
-              << "  --threads N, -j N    Number of worker threads (0 = auto, default: auto)\n"
               << "  --debug              Enable debug output\n"
-              << "  --help               Show this help\n";
+              << "  --help               Show this help\n"
+              << "\n"
+              << "Thread count can be controlled via TBB_NUM_THREADS environment variable.\n";
 }
 
 int main(int argc, char** argv)
@@ -735,14 +725,13 @@ int main(int argc, char** argv)
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
         {"source-highlight-data-dir", required_argument, nullptr, 'D'},
-        {"threads",                  required_argument, nullptr, 'j'},
         {"debug",                    no_argument,       nullptr, 'd'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr,                    0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:j:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -777,9 +766,6 @@ int main(int argc, char** argv)
         case 'D':
             sourceHighlightDataDir = optarg;
             break;
-        case 'j':
-            numThreads = static_cast<unsigned int>(std::stoi(optarg));
-            break;
         case 'd':
             debugMode = true;
             break;
@@ -807,7 +793,6 @@ int main(int argc, char** argv)
     debug("patchnar: glibc=%s\n", glibcPath.c_str());
     debug("patchnar: old-glibc=%s\n", oldGlibcPath.c_str());
     debug("patchnar: source-highlight-data-dir=%s\n", sourceHighlightDataDir.c_str());
-    debug("patchnar: threads=%u (detected: %u)\n", numThreads, getThreadCount());
     for (const auto& path : addPrefixToPaths) {
         debug("patchnar: add-prefix-to=%s\n", path.c_str());
     }
@@ -819,7 +804,6 @@ int main(int argc, char** argv)
         nar::NarProcessor processor(std::cin, std::cout);
         processor.setContentPatcher(patchContent);
         processor.setSymlinkPatcher(patchSymlink);
-        processor.setNumThreads(getThreadCount());
         processor.process();
 
         return 0;
