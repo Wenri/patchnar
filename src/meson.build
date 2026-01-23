@@ -15,16 +15,8 @@ boost_dep = dependency('boost')  # Required by source-highlight
 srchilite_dep = dependency('source-highlight', version : '>=3.0')
 tbb_dep = dependency('tbb')
 
-# Common sources for patchelf functionality
+# Common sources for patchelf functionality (used as library by patchnar)
 patchelf_sources = ['patchelf.cc', 'patchelf.h']
-
-executable(
-  'patchelf',
-  [ patchelf_sources, config_h ],
-  include_directories : include_directories('.'),
-  cpp_args : [ '-include', meson.current_build_dir() / 'config.h' ],
-  install : true,
-)
 
 # patchnar - NAR stream patcher for Android
 executable(
