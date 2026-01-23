@@ -342,6 +342,7 @@ void NarProcessor::process()
         }
     }
 
+    flushBatch();  // Flush any remaining items (e.g., root is a single file)
     out_.flush();
 }
 
