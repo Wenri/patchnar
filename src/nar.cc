@@ -2,7 +2,7 @@
  * NAR (Nix ARchive) format streaming implementation with C++23 coroutines
  *
  * Streaming architecture:
- * - Generator yields NarEvent items as parsed (no tree allocation)
+ * - Generator yields NarNode items as parsed (no tree allocation)
  * - Batch processor collects files, patches in parallel with std::execution::par
  * - Writes output immediately after each batch
  *
@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <execution>
+#include <functional>
 #include <stdexcept>
 
 namespace nar {
@@ -132,16 +133,16 @@ void NarProcessor::writeBytes(const std::vector<unsigned char>& data)
 // Generator-based Parsing
 // ============================================================================
 
-std::generator<NarEvent> NarProcessor::parse()
+std::generator<NarNode> NarProcessor::parse()
 {
     expectString(NAR_MAGIC);
 
-    for (auto&& event : parseNode("")) {
-        co_yield std::move(event);
+    for (auto&& node : parseNode("")) {
+        co_yield std::move(node);
     }
 }
 
-std::generator<NarEvent> NarProcessor::parseNode(std::string path)
+std::generator<NarNode> NarProcessor::parseNode(std::string path)
 {
     expectString("(");
     expectString("type");
@@ -155,54 +156,54 @@ std::generator<NarEvent> NarProcessor::parseNode(std::string path)
         co_yield parseSymlink(path);
         expectString(")");
     } else if (nodeType == "directory") {
-        for (auto&& event : parseDirectory(std::move(path))) {
-            co_yield std::move(event);
+        for (auto&& node : parseDirectory(std::move(path))) {
+            co_yield std::move(node);
         }
     } else {
         throw std::runtime_error("Unknown node type: " + nodeType);
     }
 }
 
-NarEvent NarProcessor::parseRegular(const std::string& path)
+NarNode NarProcessor::parseRegular(const std::string& path)
 {
-    NarEvent event{
-        .type = NarEvent::Type::RegularFile,
+    NarNode node{
+        .type = NarNode::Type::RegularFile,
         .path = path
     };
 
     std::string marker = readString();
 
     if (marker == "executable") {
-        event.executable = true;
+        node.executable = true;
         expectString("");  // Empty executable marker value
         expectString("contents");
-        event.content = readBytes();
+        node.content = readBytes();
     } else if (marker == "contents") {
-        event.content = readBytes();
+        node.content = readBytes();
     } else {
         throw std::runtime_error("Expected 'executable' or 'contents', got '" + marker + "'");
     }
 
     stats_.filesPatched++;
-    return event;
+    return node;
 }
 
-NarEvent NarProcessor::parseSymlink(const std::string& path)
+NarNode NarProcessor::parseSymlink(const std::string& path)
 {
     expectString("target");
     std::string target = readString();
 
     stats_.symlinksPatched++;
-    return NarEvent{
-        .type = NarEvent::Type::Symlink,
+    return NarNode{
+        .type = NarNode::Type::Symlink,
         .path = path,
         .target = std::move(target)
     };
 }
 
-std::generator<NarEvent> NarProcessor::parseDirectory(std::string path)
+std::generator<NarNode> NarProcessor::parseDirectory(std::string path)
 {
-    co_yield NarEvent{.type = NarEvent::Type::DirectoryStart, .path = path};
+    co_yield NarNode{.type = NarNode::Type::DirectoryStart, .path = path};
 
     while (true) {
         std::string marker = readString();
@@ -222,68 +223,68 @@ std::generator<NarEvent> NarProcessor::parseDirectory(std::string path)
 
         std::string childPath = path.empty() ? name : path + "/" + name;
 
-        co_yield NarEvent{.type = NarEvent::Type::EntryStart, .name = name, .path = childPath};
+        co_yield NarNode{.type = NarNode::Type::EntryStart, .name = name, .path = childPath};
 
-        for (auto&& event : parseNode(childPath)) {
-            co_yield std::move(event);
+        for (auto&& node : parseNode(childPath)) {
+            co_yield std::move(node);
         }
 
         expectString(")");
-        co_yield NarEvent{.type = NarEvent::Type::EntryEnd, .path = childPath};
+        co_yield NarNode{.type = NarNode::Type::EntryEnd, .path = childPath};
     }
 
     stats_.directoriesProcessed++;
-    co_yield NarEvent{.type = NarEvent::Type::DirectoryEnd, .path = path};
+    co_yield NarNode{.type = NarNode::Type::DirectoryEnd, .path = path};
 }
 
 // ============================================================================
-// Event Writer
+// Node Writer
 // ============================================================================
 
-void NarProcessor::writeEvent(const NarEvent& event)
+void NarProcessor::writeNode(const NarNode& node)
 {
-    switch (event.type) {
-        case NarEvent::Type::DirectoryStart:
+    switch (node.type) {
+        case NarNode::Type::DirectoryStart:
             writeString("(");
             writeString("type");
             writeString("directory");
             break;
 
-        case NarEvent::Type::DirectoryEnd:
+        case NarNode::Type::DirectoryEnd:
             writeString(")");
             break;
 
-        case NarEvent::Type::EntryStart:
+        case NarNode::Type::EntryStart:
             writeString("entry");
             writeString("(");
             writeString("name");
-            writeString(event.name);
+            writeString(node.name);
             writeString("node");
             break;
 
-        case NarEvent::Type::EntryEnd:
+        case NarNode::Type::EntryEnd:
             writeString(")");
             break;
 
-        case NarEvent::Type::RegularFile:
+        case NarNode::Type::RegularFile:
             writeString("(");
             writeString("type");
             writeString("regular");
-            if (event.executable) {
+            if (node.executable) {
                 writeString("executable");
                 writeString("");
             }
             writeString("contents");
-            writeBytes(event.content);
+            writeBytes(node.content);
             writeString(")");
             break;
 
-        case NarEvent::Type::Symlink:
+        case NarNode::Type::Symlink:
             writeString("(");
             writeString("type");
             writeString("symlink");
             writeString("target");
-            writeString(event.target);
+            writeString(node.target);
             writeString(")");
             break;
     }
@@ -293,25 +294,35 @@ void NarProcessor::writeEvent(const NarEvent& event)
 // Batch Processing
 // ============================================================================
 
+void NarProcessor::prepareBatch()
+{
+    for (auto& node : batch_) {
+        node.contentPatcher_ = &contentPatcher_;
+        node.symlinkPatcher_ = &symlinkPatcher_;
+    }
+}
+
+void NarProcessor::write()
+{
+    for (const auto& node : batch_) {
+        writeNode(node);
+    }
+    batch_.clear();
+}
+
 void NarProcessor::flushBatch()
 {
     if (batch_.empty()) return;
 
-    // Patch all items in parallel
-    std::for_each(std::execution::par, batch_.begin(), batch_.end(),
-        [this](NarEvent& event) {
-            if (event.type == NarEvent::Type::RegularFile && contentPatcher_) {
-                event.content = contentPatcher_(event.content, event.executable, event.path);
-            } else if (event.type == NarEvent::Type::Symlink && symlinkPatcher_) {
-                event.target = symlinkPatcher_(event.target);
-            }
-        });
+    // Prepare nodes with patcher pointers
+    prepareBatch();
+
+    // Patch all items in parallel using self-patching method
+    std::for_each(std::execution::par, begin(), end(),
+                  std::mem_fn(&NarNode::patch));
 
     // Write in order (already sorted from input)
-    for (const auto& event : batch_) {
-        writeEvent(event);
-    }
-    batch_.clear();
+    write();
 }
 
 // ============================================================================
@@ -322,22 +333,22 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    for (NarEvent event : parse()) {
-        switch (event.type) {
-            case NarEvent::Type::DirectoryStart:
-            case NarEvent::Type::DirectoryEnd:
-            case NarEvent::Type::EntryStart:
-                writeEvent(event);
+    for (NarNode node : parse()) {
+        switch (node.type) {
+            case NarNode::Type::DirectoryStart:
+            case NarNode::Type::DirectoryEnd:
+            case NarNode::Type::EntryStart:
+                writeNode(node);
                 break;
 
-            case NarEvent::Type::RegularFile:
-            case NarEvent::Type::Symlink:
-                batch_.push_back(std::move(event));
+            case NarNode::Type::RegularFile:
+            case NarNode::Type::Symlink:
+                batch_.push_back(std::move(node));
                 break;
 
-            case NarEvent::Type::EntryEnd:
+            case NarNode::Type::EntryEnd:
                 flushBatch();  // Patch and write before closing entry
-                writeEvent(event);
+                writeNode(node);
                 break;
         }
     }

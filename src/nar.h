@@ -7,7 +7,7 @@
  * - Node: "(" type {regular|symlink|directory} ... ")"
  *
  * Processing architecture:
- * - Generator yields NarEvent items as parsed (no tree in memory)
+ * - Generator yields NarNode items as parsed (no tree in memory)
  * - Batch processor collects files, patches in parallel, writes immediately
  * - Memory: O(batch_size * max_file) instead of O(total_NAR_size)
  */
@@ -26,10 +26,18 @@
 namespace nar {
 
 // ============================================================================
-// NarEvent - What the generator yields
+// Patcher function types (shared between NarNode and NarProcessor)
 // ============================================================================
 
-struct NarEvent {
+using ContentPatcher = std::function<std::vector<unsigned char>(
+    const std::vector<unsigned char>&, bool, const std::string&)>;
+using SymlinkPatcher = std::function<std::string(const std::string&)>;
+
+// ============================================================================
+// NarNode - Self-patching node yielded by the generator
+// ============================================================================
+
+struct NarNode {
     enum class Type {
         DirectoryStart, DirectoryEnd,
         EntryStart, EntryEnd,
@@ -42,6 +50,20 @@ struct NarEvent {
     std::vector<unsigned char> content;  // File content (for RegularFile)
     std::string target;                  // Symlink target (for Symlink)
     bool executable = false;             // For RegularFile
+
+    // Patcher pointers (set by NarProcessor::prepareBatch before parallel execution)
+    // Non-owning const pointers to NarProcessor's std::function members
+    const ContentPatcher* contentPatcher_ = nullptr;
+    const SymlinkPatcher* symlinkPatcher_ = nullptr;
+
+    // Self-patching method (thread-safe, modifies only this instance)
+    void patch() {
+        if (type == Type::RegularFile && contentPatcher_ && *contentPatcher_) {
+            content = (*contentPatcher_)(content, executable, path);
+        } else if (type == Type::Symlink && symlinkPatcher_ && *symlinkPatcher_) {
+            target = (*symlinkPatcher_)(target);
+        }
+    }
 };
 
 // ============================================================================
@@ -50,15 +72,25 @@ struct NarEvent {
 
 class NarProcessor {
 public:
-    using ContentPatcher = std::function<std::vector<unsigned char>(
-        const std::vector<unsigned char>&, bool, const std::string&)>;
-    using SymlinkPatcher = std::function<std::string(const std::string&)>;
-
     NarProcessor(std::istream& in, std::ostream& out);
 
     void setContentPatcher(ContentPatcher patcher) { contentPatcher_ = std::move(patcher); }
     void setSymlinkPatcher(SymlinkPatcher patcher) { symlinkPatcher_ = std::move(patcher); }
     void process();
+
+    // Iterator interface for parallel patching
+    using iterator = std::vector<NarNode>::iterator;
+    using const_iterator = std::vector<NarNode>::const_iterator;
+    iterator begin() { return batch_.begin(); }
+    iterator end() { return batch_.end(); }
+    const_iterator begin() const { return batch_.begin(); }
+    const_iterator end() const { return batch_.end(); }
+
+    // Prepare batch for patching (sets patcher pointers on all nodes)
+    void prepareBatch();
+
+    // Write all nodes in batch to output
+    void write();
 
     struct Stats {
         size_t filesPatched = 0;
@@ -70,14 +102,14 @@ public:
 
 private:
     // Generator-based parsing
-    std::generator<NarEvent> parse();
-    std::generator<NarEvent> parseNode(std::string path);
-    std::generator<NarEvent> parseDirectory(std::string path);
-    NarEvent parseRegular(const std::string& path);
-    NarEvent parseSymlink(const std::string& path);
+    std::generator<NarNode> parse();
+    std::generator<NarNode> parseNode(std::string path);
+    std::generator<NarNode> parseDirectory(std::string path);
+    NarNode parseRegular(const std::string& path);
+    NarNode parseSymlink(const std::string& path);
 
     // Streaming write
-    void writeEvent(const NarEvent& event);
+    void writeNode(const NarNode& node);
 
     // Batch processing
     void flushBatch();
@@ -97,7 +129,7 @@ private:
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
     Stats stats_;
-    std::vector<NarEvent> batch_;
+    std::vector<NarNode> batch_;
 };
 
 } // namespace nar
