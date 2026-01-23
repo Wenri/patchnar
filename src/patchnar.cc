@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <getopt.h>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -324,12 +326,12 @@ static void loadMappings(const std::string& filename)
 
 // Apply hash mappings to content (text substitution, like sed)
 // This replaces old store path basenames with new ones
-static void applyHashMappings(std::vector<unsigned char>& content)
+static void applyHashMappings(std::vector<std::byte>& content)
 {
     if (hashMappings.empty()) return;
 
     // Convert to string for easier manipulation
-    std::string str(content.begin(), content.end());
+    std::string str(reinterpret_cast<const char*>(content.data()), content.size());
     bool modified = false;
 
     for (const auto& [oldHash, newHash] : hashMappings) {
@@ -342,12 +344,13 @@ static void applyHashMappings(std::vector<unsigned char>& content)
     }
 
     if (modified) {
-        content.assign(str.begin(), str.end());
+        auto* p = reinterpret_cast<const std::byte*>(str.data());
+        content.assign(p, p + str.size());
     }
 }
 
 // Check if content is an ELF file
-static bool isElf(const std::vector<unsigned char>& content)
+static bool isElf(std::span<const std::byte> content)
 {
     if (content.size() < SELFMAG)
         return false;
@@ -356,19 +359,19 @@ static bool isElf(const std::vector<unsigned char>& content)
 
 // Check if content has a shebang (starts with #!)
 // Used only to determine if shebang patching should be applied
-static bool hasShebang(const std::vector<unsigned char>& content)
+static bool hasShebang(std::span<const std::byte> content)
 {
     if (content.size() < 2)
         return false;
-    return content[0] == '#' && content[1] == '!';
+    return static_cast<char>(content[0]) == '#' && static_cast<char>(content[1]) == '!';
 }
 
 // Check if ELF is 32-bit
-static bool isElf32(const std::vector<unsigned char>& content)
+static bool isElf32(std::span<const std::byte> content)
 {
     if (content.size() < EI_CLASS + 1)
         return false;
-    return content[EI_CLASS] == ELFCLASS32;
+    return static_cast<unsigned char>(content[EI_CLASS]) == ELFCLASS32;
 }
 
 // Replace occurrences of old path with new path in string
@@ -500,11 +503,14 @@ class ElfFile;
 
 // Patch ELF binary content
 template<class ElfFileType>
-static std::vector<unsigned char> patchElfContent(
-    std::vector<unsigned char> content,
+static std::vector<std::byte> patchElfContent(
+    std::span<const std::byte> content,
     [[maybe_unused]] bool executable)
 {
-    auto fileContents = std::make_shared<std::vector<unsigned char>>(std::move(content));
+    // Convert span to vector for patchelf (needs mutable shared_ptr)
+    auto fileContents = std::make_shared<std::vector<unsigned char>>(
+        reinterpret_cast<const unsigned char*>(content.data()),
+        reinterpret_cast<const unsigned char*>(content.data()) + content.size());
 
     try {
         ElfFileType elfFile(fileContents);
@@ -560,21 +566,27 @@ static std::vector<unsigned char> patchElfContent(
 
         elfFile.rewriteSections();
 
-        return *elfFile.fileContents;
+        // Convert back to std::byte
+        auto& uc = *elfFile.fileContents;
+        return std::vector<std::byte>(
+            reinterpret_cast<const std::byte*>(uc.data()),
+            reinterpret_cast<const std::byte*>(uc.data()) + uc.size());
     } catch (const std::exception& e) {
         debug("  ELF patch failed: %s\n", e.what());
         // Return original content on error
-        return *fileContents;
+        return std::vector<std::byte>(content.begin(), content.end());
     }
 }
 
 // Patch source file: shebang (if present) and string literals
 // The langFile is the detected .lang file (e.g., "sh.lang", "python.lang")
-static std::vector<unsigned char> patchSource(std::vector<unsigned char> content, const std::string& langFile)
+static std::vector<std::byte> patchSource(std::span<const std::byte> content, const std::string& langFile)
 {
-    if (prefix.empty()) return content;
+    if (prefix.empty()) {
+        return std::vector<std::byte>(content.begin(), content.end());
+    }
 
-    std::string str(content.begin(), content.end());
+    std::string str(reinterpret_cast<const char*>(content.data()), content.size());
     bool modified = false;
     size_t contentStart = 0;  // Where string-aware patching starts
 
@@ -671,19 +683,20 @@ static std::vector<unsigned char> patchSource(std::vector<unsigned char> content
     }
 
     if (modified) {
-        return std::vector<unsigned char>(str.begin(), str.end());
+        auto* p = reinterpret_cast<const std::byte*>(str.data());
+        return std::vector<std::byte>(p, p + str.size());
     }
-    return content;
+    return std::vector<std::byte>(content.begin(), content.end());
 }
 
 // Main content patcher
 // The path parameter is the relative path within the NAR (e.g., "bin/bash", "share/nix/nix.sh")
-static std::vector<unsigned char> patchContent(
-    const std::vector<unsigned char>& content,
+static std::vector<std::byte> patchContent(
+    std::span<const std::byte> content,
     bool executable,
     const std::string& path)
 {
-    std::vector<unsigned char> result;
+    std::vector<std::byte> result;
 
     // Extract filename from path for language detection
     std::string filename;
@@ -694,14 +707,14 @@ static std::vector<unsigned char> patchContent(
         debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
         if (isElf32(content)) {
             result = patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(
-                std::vector<unsigned char>(content), executable);
+                content, executable);
         } else {
             result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
-                std::vector<unsigned char>(content), executable);
+                content, executable);
         }
     } else {
         // For all non-ELF files, try language detection
-        std::string contentStr(content.begin(), content.end());
+        std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
         std::string langFile;
 
         if (tokenizer) {
@@ -712,13 +725,13 @@ static std::vector<unsigned char> patchContent(
         if (!langFile.empty() && PATCHABLE_LANG_FILES.count(langFile)) {
             debug("  patching source %s (%zu bytes, lang=%s)\n",
                   path.c_str(), content.size(), langFile.c_str());
-            result = patchSource(std::vector<unsigned char>(content), langFile);
+            result = patchSource(content, langFile);
         } else {
             if (!langFile.empty()) {
                 debug("  skipping %s (lang=%s not in whitelist)\n",
                       path.c_str(), langFile.c_str());
             }
-            result = content;
+            result = std::vector<std::byte>(content.begin(), content.end());
         }
     }
 

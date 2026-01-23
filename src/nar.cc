@@ -68,10 +68,10 @@ std::string NarProcessor::readString()
     return s;
 }
 
-std::vector<unsigned char> NarProcessor::readBytes()
+std::vector<std::byte> NarProcessor::readBytes()
 {
     uint64_t len = readU64();
-    std::vector<unsigned char> data(len);
+    std::vector<std::byte> data(len);
     if (len > 0) {
         readExact(data.data(), len);
     }
@@ -113,7 +113,7 @@ void NarProcessor::writeString(const std::string& s)
     }
 }
 
-void NarProcessor::writeBytes(const std::vector<unsigned char>& data)
+void NarProcessor::writeBytes(std::span<const std::byte> data)
 {
     writeU64(data.size());
     out_.write(reinterpret_cast<const char*>(data.data()), data.size());

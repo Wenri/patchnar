@@ -17,12 +17,14 @@
 #ifndef NAR_H
 #define NAR_H
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <generator>
 #include <istream>
 #include <ostream>
 #include <ranges>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -34,8 +36,8 @@ namespace nar {
 // Patcher function types (shared between NarNode and NarProcessor)
 // ============================================================================
 
-using ContentPatcher = std::function<std::vector<unsigned char>(
-    const std::vector<unsigned char>&, bool, const std::string&)>;
+using ContentPatcher = std::function<std::vector<std::byte>(
+    std::span<const std::byte>, bool, const std::string&)>;
 using SymlinkPatcher = std::function<std::string(const std::string&)>;
 
 // ============================================================================
@@ -52,7 +54,7 @@ struct NarNode {
     Type type;
     std::string name;                    // Entry name (for EntryStart)
     std::string path;                    // Full path
-    std::vector<unsigned char> content;  // File content (for RegularFile)
+    std::vector<std::byte> content;      // File content (for RegularFile)
     std::string target;                  // Symlink target (for Symlink)
     bool executable = false;             // For RegularFile
 };
@@ -95,11 +97,11 @@ private:
     void readExact(void* buf, size_t n);
     uint64_t readU64();
     std::string readString();
-    std::vector<unsigned char> readBytes();
+    std::vector<std::byte> readBytes();
     void expectString(const std::string& expected);
     void writeU64(uint64_t n);
     void writeString(const std::string& s);
-    void writeBytes(const std::vector<unsigned char>& data);
+    void writeBytes(std::span<const std::byte> data);
 
     std::istream& in_;
     std::ostream& out_;
