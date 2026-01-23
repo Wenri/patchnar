@@ -4,7 +4,7 @@ project(
   'c',
   version : files('version'),
   default_options : {
-    'cpp_std' : 'c++17',
+    'cpp_std' : 'c++23',
     'warning_level' : '2',
   },
   meson_version : '>=1.2',

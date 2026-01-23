@@ -42,7 +42,7 @@ AC_ARG_WITH([asan],
 )
 AM_CONDITIONAL([WITH_ASAN], [test x"$with_asan" = xyes])
 
-AX_CXX_COMPILE_STDCXX([17], [noext], [])
+AX_CXX_COMPILE_STDCXX([23], [noext], [])
 
 AC_ARG_WITH([ubsan],
    AS_HELP_STRING([--with-ubsan], [Build with undefined behavior sanitizer])
