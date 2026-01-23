@@ -1,11 +1,12 @@
 /*
- * NAR (Nix ARchive) format streaming implementation with C++23 coroutines
+ * NAR (Nix ARchive) format streaming implementation with TBB parallel_pipeline
  *
- * Streaming architecture:
- * - True streaming pipeline: parse() → patchedStream() → writeNode()
+ * Parallel pipeline architecture:
+ * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
  * - Generator yields NarNode items as parsed (no tree allocation)
- * - Inline patching in patchedStream() - no batching needed
- * - Memory: O(max_file) - only one file in memory at a time
+ * - Parallel patching with automatic backpressure (8 tokens in flight)
+ * - Order preserved via serial_in_order filter modes
+ * - Memory: O(8 × max_file) - bounded by token count
  */
 
 #include "nar.h"
@@ -287,32 +288,55 @@ void NarProcessor::writeNode(const NarNode& node)
 }
 
 // ============================================================================
-// Streaming Pipeline: parse() → patchedStream() → writeNode()
-// ============================================================================
-
-std::generator<NarNode> NarProcessor::patchedStream()
-{
-    for (NarNode node : parse()) {
-        if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
-            node.content = contentPatcher_(node.content, node.executable, node.path);
-        } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
-            node.target = symlinkPatcher_(node.target);
-        }
-        co_yield std::move(node);
-    }
-}
-
-// ============================================================================
-// Main Processing Pipeline
+// Main Processing Pipeline (TBB parallel_pipeline)
 // ============================================================================
 
 void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    for (const auto& node : patchedStream()) {
-        writeNode(node);
-    }
+    auto parseGen = parse();
+    auto it = parseGen.begin();
+    auto end = parseGen.end();
+
+    oneapi::tbb::parallel_pipeline(
+        8,  // max_number_of_live_tokens - automatic backpressure
+
+        // Stage 1: Parse (serial input - NAR is sequential)
+        oneapi::tbb::make_filter<void, NarNode>(
+            oneapi::tbb::filter_mode::serial_in_order,
+            [&](oneapi::tbb::flow_control& fc) -> NarNode {
+                if (it == end) {
+                    fc.stop();
+                    return {};
+                }
+                NarNode node = std::move(*it);
+                ++it;
+                return node;
+            }
+        ) &
+
+        // Stage 2: Patch (parallel - the expensive part)
+        oneapi::tbb::make_filter<NarNode, NarNode>(
+            oneapi::tbb::filter_mode::parallel,
+            [this](NarNode n) -> NarNode {
+                if (n.type == NarNode::Type::RegularFile && contentPatcher_) {
+                    n.content = contentPatcher_(n.content, n.executable, n.path);
+                } else if (n.type == NarNode::Type::Symlink && symlinkPatcher_) {
+                    n.target = symlinkPatcher_(n.target);
+                }
+                return n;
+            }
+        ) &
+
+        // Stage 3: Write (serial output - preserves order)
+        oneapi::tbb::make_filter<NarNode, void>(
+            oneapi::tbb::filter_mode::serial_in_order,
+            [this](NarNode n) {
+                writeNode(n);
+            }
+        )
+    );
 
     out_.flush();
 }

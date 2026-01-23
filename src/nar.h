@@ -1,5 +1,5 @@
 /*
- * NAR (Nix ARchive) format streaming processor with C++23 coroutines
+ * NAR (Nix ARchive) format streaming processor with TBB parallel_pipeline
  *
  * NAR format:
  * - All strings are length-prefixed (64-bit LE) and padded to 8-byte boundary
@@ -7,10 +7,11 @@
  * - Node: "(" type {regular|symlink|directory} ... ")"
  *
  * Processing architecture:
- * - True streaming pipeline: parse() → patchedStream() → writeNode()
+ * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
  * - Generator yields NarNode items as parsed (no tree in memory)
- * - Inline patching in patchedStream() - no batching needed
- * - Memory: O(max_file) - only one file in memory at a time
+ * - Parallel patching with automatic backpressure (8 tokens in flight)
+ * - Order preserved via serial_in_order filter modes
+ * - Memory: O(8 × max_file) - bounded by token count
  */
 
 #ifndef NAR_H
@@ -23,6 +24,8 @@
 #include <ostream>
 #include <string>
 #include <vector>
+
+#include <oneapi/tbb/parallel_pipeline.h>
 
 namespace nar {
 
@@ -80,9 +83,6 @@ private:
     std::generator<NarNode> parseDirectory(std::string path);
     NarNode parseRegular(const std::string& path);
     NarNode parseSymlink(const std::string& path);
-
-    // Streaming pipeline: wraps parse() with inline patching
-    std::generator<NarNode> patchedStream();
 
     // Streaming write
     void writeNode(const NarNode& node);

@@ -11,7 +11,9 @@ config_h = configure_file(output : 'config.h', configuration : confdata)
 
 # Dependencies
 thread_dep = dependency('threads')
+boost_dep = dependency('boost')  # Required by source-highlight
 srchilite_dep = dependency('source-highlight', version : '>=3.0')
+tbb_dep = dependency('tbb')
 
 # Common sources for patchelf functionality
 patchelf_sources = ['patchelf.cc', 'patchelf.h']
@@ -33,6 +35,6 @@ executable(
     '-include', meson.current_build_dir() / 'config.h',
     '-DPATCHELF_AS_LIBRARY',  # Exclude patchelf's main()
   ],
-  dependencies : [ thread_dep, srchilite_dep ],
+  dependencies : [ thread_dep, boost_dep, srchilite_dep, tbb_dep ],
   install : true,
 )
