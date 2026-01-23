@@ -3,18 +3,19 @@
  *
  * Two-phase processing architecture:
  * 1. Parse entire NAR into in-memory tree (NarNode)
- * 2. Patch all regular files in parallel using thread pool
+ * 2. Patch all regular files in parallel using std::execution::par
  * 3. Serialize patched tree back to NAR format
  *
- * This approach maximizes parallelism while preserving NAR's required
- * sequential output format.
+ * Concurrency is controlled via Semaphore to limit parallel operations.
  */
 
 #include "nar.h"
 
 #include <algorithm>
 #include <cstring>
+#include <execution>
 #include <stdexcept>
+#include <thread>
 
 namespace nar {
 
@@ -23,47 +24,6 @@ namespace nar {
 // ============================================================================
 
 static constexpr const char* NAR_MAGIC = "nix-archive-1";
-
-// ============================================================================
-// ThreadPool Implementation
-// ============================================================================
-
-ThreadPool::ThreadPool(size_t numThreads)
-{
-    workers_.reserve(numThreads);
-    for (size_t i = 0; i < numThreads; ++i) {
-        workers_.emplace_back([this] {
-            while (true) {
-                std::function<void()> task;
-                {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    condition_.wait(lock, [this] {
-                        return stop_ || !tasks_.empty();
-                    });
-
-                    if (stop_ && tasks_.empty()) {
-                        return;
-                    }
-
-                    task = std::move(tasks_.front());
-                    tasks_.pop();
-                }
-                task();
-            }
-        });
-    }
-}
-
-ThreadPool::~ThreadPool()
-{
-    stop_ = true;
-    condition_.notify_all();
-    for (auto& worker : workers_) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-}
 
 // ============================================================================
 // NarProcessor - Constructor
@@ -188,8 +148,7 @@ NarNodePtr NarProcessor::parseNode(const std::string& path)
         node = parseSymlink();
         expectString(")");
     } else if (nodeType == "directory") {
-        // parseDirectory handles its own closing ")" since it reads
-        // entries in a loop until it sees the closing paren
+        // parseDirectory handles its own closing ")"
         node = parseDirectory(path);
     } else {
         throw std::runtime_error("Unknown node type: " + nodeType);
@@ -238,9 +197,6 @@ NarNodePtr NarProcessor::parseDirectory(const std::string& path)
         std::string marker = readString();
 
         if (marker == ")") {
-            // Put back the closing paren for parseNode to consume
-            // Actually, we need to handle this differently since parseNode expects ")"
-            // Let's restructure: we'll handle ")" here and not in parseNode for directories
             break;
         }
 
@@ -264,41 +220,19 @@ NarNodePtr NarProcessor::parseDirectory(const std::string& path)
 }
 
 // ============================================================================
-// Phase 2: Patch Tree (Sequential or Parallel)
+// Phase 2: Collect Tasks and Patch in Parallel
 // ============================================================================
-
-void NarProcessor::patchTree(NarNode& node, const std::string& path)
-{
-    std::visit([this, &path](auto& n) {
-        using T = std::decay_t<decltype(n)>;
-
-        if constexpr (std::is_same_v<T, NarRegular>) {
-            if (contentPatcher_) {
-                n.content = contentPatcher_(n.content, n.executable, path);
-            }
-        } else if constexpr (std::is_same_v<T, NarSymlink>) {
-            if (symlinkPatcher_) {
-                n.target = symlinkPatcher_(n.target);
-            }
-        } else if constexpr (std::is_same_v<T, NarDirectory>) {
-            for (auto& [name, child] : n.entries) {
-                std::string childPath = path.empty() ? name : path + "/" + name;
-                patchTree(*child, childPath);
-            }
-        }
-    }, node);
-}
 
 void NarProcessor::collectPatchTasks(
     NarNode& node,
     const std::string& path,
-    std::vector<std::tuple<NarRegular*, std::string>>& tasks)
+    std::vector<PatchTask>& tasks)
 {
     std::visit([this, &path, &tasks](auto& n) {
         using T = std::decay_t<decltype(n)>;
 
         if constexpr (std::is_same_v<T, NarRegular>) {
-            tasks.emplace_back(&n, path);
+            tasks.push_back({&n, path});
         } else if constexpr (std::is_same_v<T, NarSymlink>) {
             // Symlinks are patched synchronously (fast operation)
             if (symlinkPatcher_) {
@@ -313,36 +247,34 @@ void NarProcessor::collectPatchTasks(
     }, node);
 }
 
-void NarProcessor::patchTreeParallel(NarNode& node, const std::string& path, ThreadPool& pool)
+void NarProcessor::patchAllFiles(std::vector<PatchTask>& tasks)
 {
-    // Collect all files that need patching
-    std::vector<std::tuple<NarRegular*, std::string>> tasks;
-    collectPatchTasks(node, path, tasks);
-
     if (tasks.empty() || !contentPatcher_) {
         return;
     }
 
-    // Submit all patching tasks to thread pool
-    std::vector<std::future<std::vector<unsigned char>>> futures;
-    futures.reserve(tasks.size());
-
-    for (auto& [regular, filePath] : tasks) {
-        // Capture by value for thread safety
-        auto content = regular->content;  // Copy for thread safety
-        bool executable = regular->executable;
-        auto patcher = contentPatcher_;
-
-        futures.push_back(pool.submit([patcher, content = std::move(content), executable, filePath]() {
-            return patcher(content, executable, filePath);
-        }));
+    // Determine concurrency limit
+    unsigned int maxConcurrent = numThreads_;
+    if (maxConcurrent == 0) {
+        maxConcurrent = std::max(1u, std::thread::hardware_concurrency());
     }
 
-    // Collect results in order
-    for (size_t i = 0; i < tasks.size(); ++i) {
-        auto& [regular, filePath] = tasks[i];
-        regular->content = futures[i].get();
-    }
+    // Create semaphore to limit concurrent operations
+    Semaphore semaphore(maxConcurrent);
+
+    // Patch all files in parallel with concurrency control
+    std::for_each(std::execution::par, tasks.begin(), tasks.end(),
+        [this, &semaphore](PatchTask& task) {
+            // Acquire semaphore slot (blocks if at capacity)
+            SemaphoreGuard guard(semaphore);
+
+            // Patch the file
+            task.file->content = contentPatcher_(
+                task.file->content,
+                task.file->executable,
+                task.path
+            );
+        });
 }
 
 // ============================================================================
@@ -412,15 +344,10 @@ void NarProcessor::process()
     expectString(NAR_MAGIC);
     NarNodePtr root = parseNode("");
 
-    // === Phase 2: Patch ===
-    if (numThreads_ > 1) {
-        // Parallel patching with thread pool
-        ThreadPool pool(numThreads_);
-        patchTreeParallel(*root, "", pool);
-    } else {
-        // Sequential patching
-        patchTree(*root, "");
-    }
+    // === Phase 2: Collect and Patch ===
+    std::vector<PatchTask> tasks;
+    collectPatchTasks(*root, "", tasks);
+    patchAllFiles(tasks);
 
     // === Phase 3: Write ===
     writeString(NAR_MAGIC);

@@ -8,80 +8,63 @@
  *
  * Processing phases:
  * 1. Parse: Read entire NAR into tree structure
- * 2. Patch: Apply patches to all files in parallel
+ * 2. Patch: Apply patches to all files in parallel (std::execution::par)
  * 3. Write: Serialize tree back to NAR format
  */
 
 #ifndef NAR_H
 #define NAR_H
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
+#include <condition_variable>
 #include <functional>
-#include <future>
 #include <istream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <ostream>
-#include <queue>
 #include <string>
-#include <thread>
 #include <variant>
 #include <vector>
 
 namespace nar {
 
 // ============================================================================
-// Thread Pool - RAII-managed pool for parallel task execution
+// Semaphore - Limits concurrent operations (C++17 compatible)
 // ============================================================================
 
-class ThreadPool {
+class Semaphore {
 public:
-    explicit ThreadPool(size_t numThreads);
-    ~ThreadPool();
+    explicit Semaphore(unsigned int count) : count_(count) {}
 
-    // Non-copyable, non-movable
-    ThreadPool(const ThreadPool&) = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return count_ > 0; });
+        --count_;
+    }
 
-    // Submit a task and get a future for its result
-    template<typename F, typename... Args>
-    auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>>;
-
-    // Get number of threads
-    size_t size() const { return workers_.size(); }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++count_;
+        cv_.notify_one();
+    }
 
 private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
     std::mutex mutex_;
-    std::condition_variable condition_;
-    std::atomic<bool> stop_{false};
+    std::condition_variable cv_;
+    unsigned int count_;
 };
 
-// Template implementation must be in header
-template<typename F, typename... Args>
-auto ThreadPool::submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>>
-{
-    using ReturnType = std::invoke_result_t<F, Args...>;
-
-    auto task = std::make_shared<std::packaged_task<ReturnType()>>(
-        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-    );
-
-    std::future<ReturnType> result = task->get_future();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stop_) {
-            throw std::runtime_error("ThreadPool: cannot submit to stopped pool");
-        }
-        tasks_.emplace([task]() { (*task)(); });
-    }
-    condition_.notify_one();
-    return result;
-}
+// RAII guard for semaphore
+class SemaphoreGuard {
+public:
+    explicit SemaphoreGuard(Semaphore& sem) : sem_(sem) { sem_.acquire(); }
+    ~SemaphoreGuard() { sem_.release(); }
+    SemaphoreGuard(const SemaphoreGuard&) = delete;
+    SemaphoreGuard& operator=(const SemaphoreGuard&) = delete;
+private:
+    Semaphore& sem_;
+};
 
 // ============================================================================
 // NAR Tree Structure - In-memory representation of NAR contents
@@ -100,9 +83,6 @@ using NarNodePtr = std::unique_ptr<NarNode>;
 struct NarRegular {
     std::vector<unsigned char> content;
     bool executable = false;
-
-    // For parallel patching - future holds the patched result
-    mutable std::future<std::vector<unsigned char>> patchedContent;
 };
 
 // Symlink node
@@ -128,7 +108,7 @@ using ContentPatcher = std::function<std::vector<unsigned char>(
 using SymlinkPatcher = std::function<std::string(const std::string& target)>;
 
 // ============================================================================
-// NAR Processor - Two-phase batch processing
+// NAR Processor - Two-phase batch processing with std::execution::par
 // ============================================================================
 
 class NarProcessor {
@@ -139,7 +119,7 @@ public:
     void setContentPatcher(ContentPatcher patcher) { contentPatcher_ = std::move(patcher); }
     void setSymlinkPatcher(SymlinkPatcher patcher) { symlinkPatcher_ = std::move(patcher); }
 
-    // Set number of worker threads (0 or 1 = sequential processing)
+    // Set max concurrent patches (0 = unlimited, uses hardware_concurrency)
     void setNumThreads(unsigned int n) { numThreads_ = n; }
 
     // Process entire NAR stream (parse -> patch -> write)
@@ -155,17 +135,22 @@ public:
     const Stats& stats() const { return stats_; }
 
 private:
+    // Patch task: pointer to file and its path
+    struct PatchTask {
+        NarRegular* file;
+        std::string path;
+    };
+
     // Phase 1: Parse NAR into tree
     NarNodePtr parseNode(const std::string& path);
     NarNodePtr parseRegular(const std::string& path);
     NarNodePtr parseSymlink();
     NarNodePtr parseDirectory(const std::string& path);
 
-    // Phase 2: Patch all files in parallel
-    void patchTree(NarNode& node, const std::string& path);
-    void patchTreeParallel(NarNode& node, const std::string& path, ThreadPool& pool);
+    // Phase 2: Collect tasks and patch in parallel
     void collectPatchTasks(NarNode& node, const std::string& path,
-                           std::vector<std::tuple<NarRegular*, std::string>>& tasks);
+                           std::vector<PatchTask>& tasks);
+    void patchAllFiles(std::vector<PatchTask>& tasks);
 
     // Phase 3: Write patched tree to output
     void writeNode(const NarNode& node);

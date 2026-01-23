@@ -59,10 +59,6 @@ static unsigned int getThreadCount() {
 
 // Additional paths to prefix in script strings (e.g., "/nix/var/")
 static std::vector<std::string> addPrefixToPaths;
-// Path to source-highlight data directory (for .lang files)
-static std::string sourceHighlightDataDir;
-// Mutex for source-highlight access (library is not thread-safe)
-static std::mutex sourceHighlightMutex;
 
 // String region representing a string literal in source code
 struct StringRegion {
@@ -70,28 +66,56 @@ struct StringRegion {
     size_t end;    // Ending position in the content
 };
 
-// Custom formatter that captures string literal positions during source-highlight processing
-// This formatter is registered for the "string" element type only
-class StringCapture : public srchilite::Formatter {
+// ============================================================================
+// Tokenizer - Thread-safe wrapper for source-highlight
+// ============================================================================
+// Source-highlight uses flex internally which has global state, so we need
+// a mutex to serialize access. This class encapsulates that protection.
+
+class Tokenizer {
 public:
-    std::vector<StringRegion>& regions;
-    size_t lineOffset;  // Offset of current line in the overall content
+    explicit Tokenizer(const std::string& dataDir) : dataDir_(dataDir) {}
 
-    StringCapture(std::vector<StringRegion>& r) : regions(r), lineOffset(0) {}
+    // Detect language from filename and/or content
+    // Returns .lang filename (e.g., "sh.lang") or empty string
+    std::string detectLanguage(const std::string& filename, const std::string& content);
 
-    void format(const std::string& s, const srchilite::FormatterParams* params) override {
-        if (params && params->start >= 0) {
-            size_t start = lineOffset + static_cast<size_t>(params->start);
-            regions.push_back({start, start + s.length()});
+    // Get string literal regions in source code
+    // Returns empty vector if tokenization fails
+    std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile);
+
+private:
+    std::string dataDir_;
+    std::mutex mutex_;  // Protects flex scanner (not thread-safe)
+
+    // Custom formatter that captures string literal positions
+    class StringCapture : public srchilite::Formatter {
+    public:
+        std::vector<StringRegion>& regions;
+        size_t lineOffset = 0;
+
+        explicit StringCapture(std::vector<StringRegion>& r) : regions(r) {}
+
+        void format(const std::string& s, const srchilite::FormatterParams* params) override {
+            if (params && params->start >= 0) {
+                size_t start = lineOffset + static_cast<size_t>(params->start);
+                regions.push_back({start, start + s.length()});
+            }
         }
-    }
+    };
+
+    // Null formatter that discards everything
+    class NullFormatter : public srchilite::Formatter {
+    public:
+        void format(const std::string&, const srchilite::FormatterParams*) override {}
+    };
 };
 
-// Null formatter that discards everything (for non-string elements)
-class NullFormatter : public srchilite::Formatter {
-public:
-    void format(const std::string&, const srchilite::FormatterParams*) override {}
-};
+// Global tokenizer instance (initialized in main when source-highlight data dir is set)
+static std::unique_ptr<Tokenizer> tokenizer;
+
+// Source-highlight data directory (set via --source-highlight-data-dir)
+static std::string sourceHighlightDataDir;
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -108,21 +132,17 @@ static void debug(const char* format, ...)
     }
 }
 
-// Detect language from filename and/or content using source-highlight
+// Tokenizer::detectLanguage - Detect language from filename and/or content
 // Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
 // Detection priority: 1) Filename-based (LangMap) 2) Content-based (LanguageInfer)
-// Thread-safe: uses mutex to protect source-highlight access
-static std::string detectLanguage(const std::string& filename, const std::string& content)
+// Thread-safe: uses mutex to protect source-highlight access (flex uses global state)
+std::string Tokenizer::detectLanguage(const std::string& filename, const std::string& content)
 {
-    if (sourceHighlightDataDir.empty()) {
-        return "";
-    }
-
     // Lock for thread safety - source-highlight is not thread-safe
-    std::lock_guard<std::mutex> lock(sourceHighlightMutex);
+    std::lock_guard<std::mutex> lock(mutex_);
 
     try {
-        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
+        srchilite::LangMap langMap(dataDir_, "lang.map");
 
         // 1. Try filename-based detection first
         std::string langFile = langMap.getMappedFileNameFromFileName(filename);
@@ -154,20 +174,20 @@ static std::string detectLanguage(const std::string& filename, const std::string
     return "";
 }
 
-// Get string literal regions in source code using source-highlight
+// Tokenizer::getStringRegions - Get string literal regions in source code
 // Takes the .lang file directly (already detected by detectLanguage)
-// Returns empty vector if language is not set or processing fails
-// Thread-safe: uses mutex to protect source-highlight access
-static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile)
+// Returns empty vector if language is empty or processing fails
+// Thread-safe: uses mutex to protect source-highlight access (flex uses global state)
+std::vector<StringRegion> Tokenizer::getStringRegions(const std::string& content, const std::string& langFile)
 {
     std::vector<StringRegion> regions;
 
-    if (sourceHighlightDataDir.empty() || langFile.empty()) {
+    if (langFile.empty()) {
         return regions;
     }
 
     // Lock for thread safety - source-highlight is not thread-safe
-    std::lock_guard<std::mutex> lock(sourceHighlightMutex);
+    std::lock_guard<std::mutex> lock(mutex_);
 
     try {
         debug("  tokenizing with %s\n", langFile.c_str());
@@ -178,7 +198,7 @@ static std::vector<StringRegion> getStringRegions(const std::string& content, co
 
         // Get the highlight state for the detected language
         srchilite::SourceHighlighter highlighter(
-            langDefManager.getHighlightState(sourceHighlightDataDir, langFile));
+            langDefManager.getHighlightState(dataDir_, langFile));
 
         // Disable optimization to get accurate position information
         highlighter.setOptimize(false);
@@ -586,9 +606,9 @@ static std::vector<unsigned char> patchSource(std::vector<unsigned char> content
     // === STRING-AWARE CONTENT PATCHING ===
     // Patch additional paths (like /nix/var/) only inside string literals
     // Uses source-highlight with the pre-detected language
-    if (!addPrefixToPaths.empty() && !langFile.empty()) {
+    if (!addPrefixToPaths.empty() && !langFile.empty() && tokenizer) {
         // Get string regions using source-highlight with the detected language
-        std::vector<StringRegion> stringRegions = getStringRegions(str, langFile);
+        std::vector<StringRegion> stringRegions = tokenizer->getStringRegions(str, langFile);
 
         if (!stringRegions.empty()) {
             debug("  patching additional paths in %zu string regions\n", stringRegions.size());
@@ -623,7 +643,7 @@ static std::vector<unsigned char> patchSource(std::vector<unsigned char> content
                     pos += pattern.length();
                 }
             }
-        } else if (!sourceHighlightDataDir.empty()) {
+        } else {
             debug("  no string regions found, skipping additional path patching\n");
         }
     }
@@ -660,7 +680,11 @@ static std::vector<unsigned char> patchContent(
     } else {
         // For all non-ELF files, try language detection
         std::string contentStr(content.begin(), content.end());
-        std::string langFile = detectLanguage(filename, contentStr);
+        std::string langFile;
+
+        if (tokenizer) {
+            langFile = tokenizer->detectLanguage(filename, contentStr);
+        }
 
         if (!langFile.empty()) {
             debug("  patching source %s (%zu bytes, lang=%s)\n",
@@ -772,6 +796,11 @@ int main(int argc, char** argv)
         std::cerr << "Error: --prefix is required\n";
         showHelp(argv[0]);
         return 1;
+    }
+
+    // Initialize tokenizer if source-highlight data dir is set
+    if (!sourceHighlightDataDir.empty()) {
+        tokenizer = std::make_unique<Tokenizer>(sourceHighlightDataDir);
     }
 
     debug("patchnar: prefix=%s\n", prefix.c_str());
