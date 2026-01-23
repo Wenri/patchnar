@@ -81,33 +81,10 @@ make
 sudo make install
 ```
 
-### Via CMake
-
-```console
-mkdir build && cd build
-cmake .. -GNinja
-ninja
-sudo ninja install
-```
-
-### Via Meson
-
-```console
-meson setup build
-meson compile -C build
-sudo meson install -C build
-```
-
 ### Via Nix
 
 ```console
-# Build patchnar
 nix build
-
-# Build with specific build system
-nix build .#patchelf          # autotools (default)
-nix build .#patchelf-cmake    # CMake
-nix build .#patchelf-meson    # Meson
 ```
 
 ## How It Works
