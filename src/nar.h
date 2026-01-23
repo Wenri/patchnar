@@ -22,6 +22,7 @@
 #include <generator>
 #include <istream>
 #include <ostream>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,9 @@ public:
     void setSymlinkPatcher(SymlinkPatcher patcher) { symlinkPatcher_ = std::move(patcher); }
     void process();
 
+    // Direct access to node generator
+    std::generator<NarNode>& nodes() { return parseGen_; }
+
     struct Stats {
         size_t filesPatched = 0;
         size_t symlinksPatched = 0;
@@ -102,6 +106,8 @@ private:
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
     Stats stats_;
+    std::generator<NarNode> parseGen_;
+    std::ranges::iterator_t<std::generator<NarNode>> it_;
 };
 
 } // namespace nar

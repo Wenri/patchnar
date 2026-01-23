@@ -27,7 +27,7 @@ static constexpr const char* NAR_MAGIC = "nix-archive-1";
 // ============================================================================
 
 NarProcessor::NarProcessor(std::istream& in, std::ostream& out)
-    : in_(in), out_(out)
+    : in_(in), out_(out), parseGen_(parse()), it_(parseGen_.begin())
 {
 }
 
@@ -295,23 +295,19 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    auto parseGen = parse();
-    auto it = parseGen.begin();
-    auto end = parseGen.end();
-
     oneapi::tbb::parallel_pipeline(
         8,  // max_number_of_live_tokens - automatic backpressure
 
         // Stage 1: Parse (serial input - NAR is sequential)
         oneapi::tbb::make_filter<void, NarNode>(
             oneapi::tbb::filter_mode::serial_in_order,
-            [&](oneapi::tbb::flow_control& fc) -> NarNode {
-                if (it == end) {
+            [this](oneapi::tbb::flow_control& fc) -> NarNode {
+                if (it_ == parseGen_.end()) {
                     fc.stop();
                     return {};
                 }
-                NarNode node = std::move(*it);
-                ++it;
+                NarNode node = std::move(*it_);
+                ++it_;
                 return node;
             }
         ) &
