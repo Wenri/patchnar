@@ -1,10 +1,10 @@
 /*
- * NAR (Nix ARchive) format implementation with parallel batch processing
+ * NAR (Nix ARchive) format streaming implementation with C++23 coroutines
  *
- * Three-phase processing architecture:
- * 1. Parse entire NAR into in-memory tree (NarNode)
- * 2. Patch all regular files in parallel using std::execution::par
- * 3. Serialize patched tree back to NAR format
+ * Streaming architecture:
+ * - Generator yields NarEvent items as parsed (no tree allocation)
+ * - Batch processor collects files, patches in parallel with std::execution::par
+ * - Writes output immediately after each batch
  *
  * Thread count is controlled by TBB via TBB_NUM_THREADS environment variable.
  */
@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cstring>
 #include <execution>
-#include <functional>
 #include <stdexcept>
 
 namespace nar {
@@ -130,68 +129,80 @@ void NarProcessor::writeBytes(const std::vector<unsigned char>& data)
 }
 
 // ============================================================================
-// Phase 1: Parse NAR into Tree
+// Generator-based Parsing
 // ============================================================================
 
-std::unique_ptr<NarNode> NarProcessor::parseNode(const std::string& path)
+std::generator<NarEvent> NarProcessor::parse()
+{
+    expectString(NAR_MAGIC);
+
+    for (auto&& event : parseNode("")) {
+        co_yield std::move(event);
+    }
+}
+
+std::generator<NarEvent> NarProcessor::parseNode(std::string path)
 {
     expectString("(");
     expectString("type");
 
     std::string nodeType = readString();
 
-    std::unique_ptr<NarNode> node;
     if (nodeType == "regular") {
-        node = parseRegular(path);
+        co_yield parseRegular(path);
         expectString(")");
     } else if (nodeType == "symlink") {
-        node = parseSymlink();
+        co_yield parseSymlink(path);
         expectString(")");
     } else if (nodeType == "directory") {
-        // parseDirectory handles its own closing ")"
-        node = parseDirectory(path);
+        for (auto&& event : parseDirectory(std::move(path))) {
+            co_yield std::move(event);
+        }
     } else {
         throw std::runtime_error("Unknown node type: " + nodeType);
     }
-
-    return node;
 }
 
-std::unique_ptr<NarNode> NarProcessor::parseRegular(const std::string& /*path*/)
+NarEvent NarProcessor::parseRegular(const std::string& path)
 {
-    auto regular = std::make_unique<NarNode>(NarRegular{});
-    auto& reg = std::get<NarRegular>(*regular);
+    NarEvent event{
+        .type = NarEvent::Type::RegularFile,
+        .path = path
+    };
 
     std::string marker = readString();
 
     if (marker == "executable") {
-        reg.executable = true;
+        event.executable = true;
         expectString("");  // Empty executable marker value
         expectString("contents");
-        reg.content = readBytes();
+        event.content = readBytes();
     } else if (marker == "contents") {
-        reg.content = readBytes();
+        event.content = readBytes();
     } else {
         throw std::runtime_error("Expected 'executable' or 'contents', got '" + marker + "'");
     }
 
     stats_.filesPatched++;
-    return regular;
+    return event;
 }
 
-std::unique_ptr<NarNode> NarProcessor::parseSymlink()
+NarEvent NarProcessor::parseSymlink(const std::string& path)
 {
     expectString("target");
     std::string target = readString();
 
     stats_.symlinksPatched++;
-    return std::make_unique<NarNode>(NarSymlink{std::move(target)});
+    return NarEvent{
+        .type = NarEvent::Type::Symlink,
+        .path = path,
+        .target = std::move(target)
+    };
 }
 
-std::unique_ptr<NarNode> NarProcessor::parseDirectory(const std::string& path)
+std::generator<NarEvent> NarProcessor::parseDirectory(std::string path)
 {
-    auto directory = std::make_unique<NarNode>(NarDirectory{});
-    auto& dir = std::get<NarDirectory>(*directory);
+    co_yield NarEvent{.type = NarEvent::Type::DirectoryStart, .path = path};
 
     while (true) {
         std::string marker = readString();
@@ -210,110 +221,97 @@ std::unique_ptr<NarNode> NarProcessor::parseDirectory(const std::string& path)
         expectString("node");
 
         std::string childPath = path.empty() ? name : path + "/" + name;
-        dir.entries[name] = parseNode(childPath);
+
+        co_yield NarEvent{.type = NarEvent::Type::EntryStart, .name = name, .path = childPath};
+
+        for (auto&& event : parseNode(childPath)) {
+            co_yield std::move(event);
+        }
 
         expectString(")");
+        co_yield NarEvent{.type = NarEvent::Type::EntryEnd, .path = childPath};
     }
 
     stats_.directoriesProcessed++;
-    return directory;
+    co_yield NarEvent{.type = NarEvent::Type::DirectoryEnd, .path = path};
 }
 
 // ============================================================================
-// Phase 2: Collect Tasks and Patch in Parallel
+// Event Writer
 // ============================================================================
 
-void NarProcessor::collectPatchTasks(
-    NarNode& node,
-    const std::string& path,
-    std::vector<PatchTask>& tasks)
+void NarProcessor::writeEvent(const NarEvent& event)
 {
-    std::visit([this, &path, &tasks](auto& n) {
-        using T = std::decay_t<decltype(n)>;
-
-        if constexpr (std::is_same_v<T, NarRegular>) {
-            tasks.push_back({n, path, contentPatcher_});
-        } else if constexpr (std::is_same_v<T, NarSymlink>) {
-            // Symlinks are patched synchronously (fast operation)
-            if (symlinkPatcher_) {
-                n.target = symlinkPatcher_(n.target);
-            }
-        } else if constexpr (std::is_same_v<T, NarDirectory>) {
-            for (auto& [name, child] : n.entries) {
-                std::string childPath = path.empty() ? name : path + "/" + name;
-                collectPatchTasks(*child, childPath, tasks);
-            }
-        }
-    }, node);
-}
-
-void NarProcessor::patchAllFiles(std::vector<PatchTask>& tasks)
-{
-    if (tasks.empty() || !contentPatcher_) {
-        return;
-    }
-
-    // Patch all files in parallel
-    // Thread count controlled by TBB_NUM_THREADS environment variable
-    std::for_each(std::execution::par, tasks.begin(), tasks.end(),
-        std::mem_fn(&PatchTask::operator()));
-}
-
-// ============================================================================
-// Phase 3: Write Patched Tree to Output
-// ============================================================================
-
-void NarProcessor::writeNode(const NarNode& node)
-{
-    writeString("(");
-    writeString("type");
-
-    std::visit([this](const auto& n) {
-        using T = std::decay_t<decltype(n)>;
-
-        if constexpr (std::is_same_v<T, NarRegular>) {
-            writeString("regular");
-            writeRegular(n);
-        } else if constexpr (std::is_same_v<T, NarSymlink>) {
-            writeString("symlink");
-            writeSymlink(n);
-        } else if constexpr (std::is_same_v<T, NarDirectory>) {
+    switch (event.type) {
+        case NarEvent::Type::DirectoryStart:
+            writeString("(");
+            writeString("type");
             writeString("directory");
-            writeDirectory(n);
-        }
-    }, node);
+            break;
 
-    writeString(")");
-}
+        case NarEvent::Type::DirectoryEnd:
+            writeString(")");
+            break;
 
-void NarProcessor::writeRegular(const NarRegular& regular)
-{
-    if (regular.executable) {
-        writeString("executable");
-        writeString("");
+        case NarEvent::Type::EntryStart:
+            writeString("entry");
+            writeString("(");
+            writeString("name");
+            writeString(event.name);
+            writeString("node");
+            break;
+
+        case NarEvent::Type::EntryEnd:
+            writeString(")");
+            break;
+
+        case NarEvent::Type::RegularFile:
+            writeString("(");
+            writeString("type");
+            writeString("regular");
+            if (event.executable) {
+                writeString("executable");
+                writeString("");
+            }
+            writeString("contents");
+            writeBytes(event.content);
+            writeString(")");
+            break;
+
+        case NarEvent::Type::Symlink:
+            writeString("(");
+            writeString("type");
+            writeString("symlink");
+            writeString("target");
+            writeString(event.target);
+            writeString(")");
+            break;
     }
-    writeString("contents");
-    writeBytes(regular.content);
 }
 
-void NarProcessor::writeSymlink(const NarSymlink& symlink)
-{
-    writeString("target");
-    writeString(symlink.target);
-}
+// ============================================================================
+// Batch Processing
+// ============================================================================
 
-void NarProcessor::writeDirectory(const NarDirectory& directory)
+void NarProcessor::flushBatch()
 {
-    // NAR requires entries in lexicographic order - std::map already provides this
-    for (const auto& [name, child] : directory.entries) {
-        writeString("entry");
-        writeString("(");
-        writeString("name");
-        writeString(name);
-        writeString("node");
-        writeNode(*child);
-        writeString(")");
+    if (batch_.empty()) return;
+
+    // Patch all items in parallel
+    std::for_each(std::execution::par, batch_.begin(), batch_.end(),
+        [this](NarEvent& event) {
+            if (event.type == NarEvent::Type::RegularFile && contentPatcher_) {
+                event.content = contentPatcher_(event.content, event.executable, event.path);
+            } else if (event.type == NarEvent::Type::Symlink && symlinkPatcher_) {
+                event.target = symlinkPatcher_(event.target);
+            }
+        });
+
+    // Write in order (already sorted from input)
+    for (const auto& event : batch_) {
+        writeEvent(event);
     }
+    batch_.clear();
 }
 
 // ============================================================================
@@ -322,18 +320,28 @@ void NarProcessor::writeDirectory(const NarDirectory& directory)
 
 void NarProcessor::process()
 {
-    // === Phase 1: Parse ===
-    expectString(NAR_MAGIC);
-    std::unique_ptr<NarNode> root = parseNode("");
-
-    // === Phase 2: Collect and Patch ===
-    std::vector<PatchTask> tasks;
-    collectPatchTasks(*root, "", tasks);
-    patchAllFiles(tasks);
-
-    // === Phase 3: Write ===
     writeString(NAR_MAGIC);
-    writeNode(*root);
+
+    for (NarEvent event : parse()) {
+        switch (event.type) {
+            case NarEvent::Type::DirectoryStart:
+            case NarEvent::Type::DirectoryEnd:
+            case NarEvent::Type::EntryStart:
+                writeEvent(event);
+                break;
+
+            case NarEvent::Type::RegularFile:
+            case NarEvent::Type::Symlink:
+                batch_.push_back(std::move(event));
+                break;
+
+            case NarEvent::Type::EntryEnd:
+                flushBatch();  // Patch and write before closing entry
+                writeEvent(event);
+                break;
+        }
+    }
+
     out_.flush();
 }
 

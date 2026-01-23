@@ -1,15 +1,15 @@
 /*
- * NAR (Nix ARchive) format reader/writer with parallel batch processing
+ * NAR (Nix ARchive) format streaming processor with C++23 coroutines
  *
  * NAR format:
  * - All strings are length-prefixed (64-bit LE) and padded to 8-byte boundary
  * - Header: "nix-archive-1"
  * - Node: "(" type {regular|symlink|directory} ... ")"
  *
- * Processing phases:
- * 1. Parse: Read entire NAR into tree structure
- * 2. Patch: Apply patches to all files in parallel (std::execution::par)
- * 3. Write: Serialize tree back to NAR format
+ * Processing architecture:
+ * - Generator yields NarEvent items as parsed (no tree in memory)
+ * - Batch processor collects files, patches in parallel, writes immediately
+ * - Memory: O(batch_size * max_file) instead of O(total_NAR_size)
  */
 
 #ifndef NAR_H
@@ -17,39 +17,35 @@
 
 #include <cstdint>
 #include <functional>
+#include <generator>
 #include <istream>
-#include <map>
-#include <memory>
 #include <ostream>
 #include <string>
-#include <variant>
 #include <vector>
 
 namespace nar {
 
 // ============================================================================
-// NAR Tree Structure - In-memory representation of NAR contents
+// NarEvent - What the generator yields
 // ============================================================================
 
-struct NarRegular {
-    std::vector<unsigned char> content;
-    bool executable = false;
-};
+struct NarEvent {
+    enum class Type {
+        DirectoryStart, DirectoryEnd,
+        EntryStart, EntryEnd,
+        RegularFile, Symlink
+    };
 
-struct NarSymlink {
-    std::string target;
-};
-
-struct NarDirectory;  // Forward declaration for recursive type
-
-using NarNode = std::variant<NarRegular, NarSymlink, NarDirectory>;
-
-struct NarDirectory {
-    std::map<std::string, std::unique_ptr<NarNode>> entries;
+    Type type;
+    std::string name;                    // Entry name (for EntryStart)
+    std::string path;                    // Full path
+    std::vector<unsigned char> content;  // File content (for RegularFile)
+    std::string target;                  // Symlink target (for Symlink)
+    bool executable = false;             // For RegularFile
 };
 
 // ============================================================================
-// NAR Processor - Two-phase batch processing with std::execution::par
+// NarProcessor - Streaming processor with parallel batch patching
 // ============================================================================
 
 class NarProcessor {
@@ -72,29 +68,21 @@ public:
     };
     const Stats& stats() const { return stats_; }
 
-    struct PatchTask {
-        NarRegular& file;
-        const std::string path;
-        const ContentPatcher& patcher;
-        void operator()() {
-            file.content = patcher(file.content, file.executable, path);
-        }
-    };
-
 private:
-    std::unique_ptr<NarNode> parseNode(const std::string& path);
-    std::unique_ptr<NarNode> parseRegular(const std::string& path);
-    std::unique_ptr<NarNode> parseSymlink();
-    std::unique_ptr<NarNode> parseDirectory(const std::string& path);
+    // Generator-based parsing
+    std::generator<NarEvent> parse();
+    std::generator<NarEvent> parseNode(std::string path);
+    std::generator<NarEvent> parseDirectory(std::string path);
+    NarEvent parseRegular(const std::string& path);
+    NarEvent parseSymlink(const std::string& path);
 
-    void collectPatchTasks(NarNode& node, const std::string& path, std::vector<PatchTask>& tasks);
-    void patchAllFiles(std::vector<PatchTask>& tasks);
+    // Streaming write
+    void writeEvent(const NarEvent& event);
 
-    void writeNode(const NarNode& node);
-    void writeRegular(const NarRegular& regular);
-    void writeSymlink(const NarSymlink& symlink);
-    void writeDirectory(const NarDirectory& directory);
+    // Batch processing
+    void flushBatch();
 
+    // Low-level I/O
     void readExact(void* buf, size_t n);
     uint64_t readU64();
     std::string readString();
@@ -109,6 +97,7 @@ private:
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
     Stats stats_;
+    std::vector<NarEvent> batch_;
 };
 
 } // namespace nar
