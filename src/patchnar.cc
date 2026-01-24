@@ -23,7 +23,6 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
-#include <mutex>
 #include <set>
 #include <span>
 #include <sstream>
@@ -59,10 +58,8 @@ struct StringRegion {
 };
 
 // ============================================================================
-// Tokenizer - Thread-safe wrapper for source-highlight
+// Tokenizer - Wrapper for source-highlight
 // ============================================================================
-// Source-highlight uses flex internally which has global state, so we need
-// a mutex to serialize access. This class encapsulates that protection.
 
 class Tokenizer {
 public:
@@ -78,7 +75,6 @@ public:
 
 private:
     std::string dataDir_;
-    std::mutex mutex_;  // Protects flex scanner (not thread-safe)
 
     // Custom formatter that captures string literal positions
     class StringCapture : public srchilite::Formatter {
@@ -168,36 +164,10 @@ static const std::unordered_map<std::string, std::string> EXTENSION_TO_LANG = {
 };
 
 // Whitelist of language files worth tokenizing for string literal patching
-// These are languages where /nix/store paths commonly appear in string literals
+// DEBUG: Only shell scripts for now to isolate performance issues
 static const std::set<std::string> PATCHABLE_LANG_FILES = {
-    // Shell scripts (most common case)
     "sh.lang",
     "zsh.lang",
-
-    // Scripting languages
-    "python.lang",
-    "perl.lang",
-    "ruby.lang",
-    "lua.lang",
-    "tcl.lang",
-
-    // Web/JS (node scripts, configs)
-    "javascript.lang",
-    "json.lang",
-
-    // Config files
-    "conf.lang",
-    "desktop.lang",
-    "properties.lang",
-    "ini.lang",
-
-    // Build systems
-    "makefile.lang",
-    "m4.lang",
-
-    // Other
-    "xml.lang",
-    "awk.lang",
 };
 
 static void debug(const char* format, ...)
@@ -244,9 +214,6 @@ static bool shouldSkipByExtension(const std::string& filename)
 // Thread-safe: uses mutex to protect source-highlight access (flex uses global state)
 std::string Tokenizer::detectLanguage(const std::string& filename, const std::string& content)
 {
-    // Lock for thread safety - source-highlight is not thread-safe
-    std::lock_guard<std::mutex> lock(mutex_);
-
     try {
         srchilite::LangMap langMap(dataDir_, "lang.map");
 
@@ -291,9 +258,6 @@ std::vector<StringRegion> Tokenizer::getStringRegions(const std::string& content
     if (langFile.empty()) {
         return regions;
     }
-
-    // Lock for thread safety - source-highlight is not thread-safe
-    std::lock_guard<std::mutex> lock(mutex_);
 
     try {
         debug("  tokenizing with %s\n", langFile.c_str());
