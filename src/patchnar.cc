@@ -40,8 +40,12 @@
 #include <srchilite/regexrulefactory.h>
 #include <srchilite/langmap.h>
 #include <srchilite/languageinfer.h>
+#include <srchilite/textstyleformatter.h>
+#include <srchilite/bufferedoutput.h>
+#include <srchilite/chartranslator.h>
 #include <boost/shared_ptr.hpp>
 #include <boost/make_shared.hpp>
+#include <boost/regex.hpp>
 
 // Configuration
 // Installation prefix set at compile time via configure --with-install-prefix
@@ -54,46 +58,84 @@ static bool debugMode = false;
 // Default includes /nix/var/ which is commonly needed for nix daemon scripts
 static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
-// String region representing a string literal in source code
-struct StringRegion {
-    size_t start;  // Starting position in the content
-    size_t end;    // Ending position in the content
-};
-
 // Source-highlight data directory (set at compile time via configure)
 // configure.ac auto-detects from pkg-config or uses --with-source-highlight-data-dir
 static const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
-
-// Custom formatter that captures string literal positions
-class StringCapture : public srchilite::Formatter {
-public:
-    std::vector<StringRegion>& regions;
-    size_t lineOffset = 0;
-
-    explicit StringCapture(std::vector<StringRegion>& r) : regions(r) {}
-
-    void format(const std::string& s, const srchilite::FormatterParams* params) override {
-        if (params && params->start >= 0) {
-            size_t start = lineOffset + static_cast<size_t>(params->start);
-            regions.push_back({start, start + s.length()});
-        }
-    }
-};
-
-// Null formatter that discards everything
-class NullFormatter : public srchilite::Formatter {
-public:
-    void format(const std::string&, const srchilite::FormatterParams*) override {}
-};
-
-// Forward declarations
-static std::string detectLanguage(const std::string& filename, const std::string& content);
-static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile);
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
 // e.g., "abc123...-bash-5.2" -> "xyz789...-bash-5.2"
 static std::map<std::string, std::string> hashMappings;
+
+// Custom PreFormatter that translates Nix store paths in string literals
+// Extends CharTranslator for glibc regex replacement + manual prefix/hash handling
+class NixPathTranslator : public srchilite::CharTranslator {
+public:
+    NixPathTranslator() : srchilite::CharTranslator() {
+        // Use CharTranslator's regex for glibc path replacement
+        // This is safe because oldGlibcPath is a unique exact match
+        if (!oldGlibcPath.empty() && !glibcPath.empty()) {
+            // Escape regex special characters in the path
+            std::string escapedOld = escapeRegex(oldGlibcPath);
+            set_translation(escapedOld, glibcPath);
+        }
+    }
+
+protected:
+    const std::string doPreformat(const std::string& text) override {
+        // 1. Apply CharTranslator's regex (glibc replacement)
+        std::string result = CharTranslator::doPreformat(text);
+
+        // 2. Apply hash mappings (dynamic lookup - can't use regex)
+        for (const auto& [oldHash, newHash] : hashMappings) {
+            size_t pos = 0;
+            while ((pos = result.find(oldHash, pos)) != std::string::npos) {
+                result.replace(pos, oldHash.length(), newHash);
+                pos += newHash.length();
+            }
+        }
+
+        // 3. Add prefix to /nix/store/ paths (with already-prefixed check)
+        if (!prefix.empty()) {
+            size_t pos = 0;
+            while ((pos = result.find("/nix/store/", pos)) != std::string::npos) {
+                bool alreadyPrefixed = (pos >= prefix.length() &&
+                    result.substr(pos - prefix.length(), prefix.length()) == prefix);
+                if (!alreadyPrefixed) {
+                    result.insert(pos, prefix);
+                    pos += prefix.length();
+                }
+                pos += 11;  // Skip "/nix/store/"
+            }
+
+            // Add prefix to additional paths (e.g., /nix/var/)
+            for (const auto& pattern : addPrefixToPaths) {
+                pos = 0;
+                while ((pos = result.find(pattern, pos)) != std::string::npos) {
+                    bool alreadyPrefixed = (pos >= prefix.length() &&
+                        result.substr(pos - prefix.length(), prefix.length()) == prefix);
+                    if (!alreadyPrefixed) {
+                        result.insert(pos, prefix);
+                        pos += prefix.length();
+                    }
+                    pos += pattern.length();
+                }
+            }
+        }
+
+        return result;
+    }
+
+private:
+    // Escape regex special characters
+    static std::string escapeRegex(const std::string& s) {
+        static const boost::regex specialChars(R"([.^$|()[\]{}*+?\\])");
+        return boost::regex_replace(s, specialChars, R"(\\&)");
+    }
+};
+
+// Forward declarations
+static std::string detectLanguage(const std::string& filename, const std::string& content);
 
 // Extensions to skip entirely (don't even call source-highlight)
 // These are documentation, binary, or compressed files that never need patching
@@ -243,81 +285,68 @@ static std::string detectLanguage(const std::string& filename, const std::string
     return "";
 }
 
-// Get string literal regions in source code
-// Returns empty vector if language is empty or processing fails
-static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile)
+// One-pass source patching using PreFormatter
+// Tokenizes content and applies path translation only to string literals
+static std::string patchSourceWithHighlighter(
+    const std::string& content,
+    const std::string& langFile)
 {
-    std::vector<StringRegion> regions;
-
     if (langFile.empty() || sourceHighlightDataDir.empty()) {
-        return regions;
+        return content;
     }
 
     try {
-        debug("  tokenizing with %s\n", langFile.c_str());
+        debug("  tokenizing and patching with %s\n", langFile.c_str());
 
-        // Initialize language definition manager with regex rule factory
         srchilite::RegexRuleFactory ruleFactory;
         srchilite::LangDefManager langDefManager(&ruleFactory);
-
-        // Get the highlight state for the detected language
         srchilite::SourceHighlighter highlighter(
             langDefManager.getHighlightState(sourceHighlightDataDir, langFile));
-
-        // Disable optimization to get accurate position information
         highlighter.setOptimize(false);
 
-        // Create formatters (source-highlight uses boost::shared_ptr)
-        auto stringCapture = boost::make_shared<StringCapture>(regions);
-        auto nullFormatter = boost::make_shared<NullFormatter>();
+        // Output collection
+        std::ostringstream outputStream;
+        srchilite::BufferedOutput bufferedOutput(outputStream);
 
-        // Create formatter manager with null default formatter
-        srchilite::FormatterManager formatterManager(nullFormatter);
+        // Identity formatter for non-string elements (outputs text as-is)
+        auto identityFormatter = boost::make_shared<srchilite::TextStyleFormatter>(
+            "$text", &bufferedOutput);
 
-        // Register string formatter - only captures string literals
-        formatterManager.addFormatter("string", stringCapture);
+        // String formatter with path translation
+        NixPathTranslator translator;
+        auto stringFormatter = boost::make_shared<srchilite::TextStyleFormatter>(
+            "$text", &bufferedOutput);
+        stringFormatter->setPreFormatter(&translator);
 
+        // Register formatters
+        srchilite::FormatterManager formatterManager(identityFormatter);
+        formatterManager.addFormatter("string", stringFormatter);
         highlighter.setFormatterManager(&formatterManager);
 
-        // Set up position tracking
-        srchilite::FormatterParams params;
-        highlighter.setFormatterParams(&params);
-
-        // Process each line
-        std::istringstream stream(content);
+        // Process line by line
+        std::istringstream inputStream(content);
         std::string line;
-        size_t lineOffset = 0;
+        bool firstLine = true;
 
-        while (std::getline(stream, line)) {
-            // Update formatter with current line offset
-            stringCapture->lineOffset = lineOffset;
-            params.start = 0;
-
+        while (std::getline(inputStream, line)) {
+            if (!firstLine) {
+                bufferedOutput.output("\n");
+            }
             highlighter.highlightParagraph(line);
-
-            // Move to next line (+1 for newline character)
-            lineOffset += line.length() + 1;
+            firstLine = false;
         }
 
-        debug("  found %zu string regions\n", regions.size());
+        // Preserve trailing newline
+        if (!content.empty() && content.back() == '\n') {
+            bufferedOutput.output("\n");
+        }
+
+        return outputStream.str();
 
     } catch (const std::exception& e) {
-        debug("  source-highlight failed: %s\n", e.what());
-        regions.clear();
+        debug("  source-highlight patching failed: %s\n", e.what());
+        return content;
     }
-
-    return regions;
-}
-
-// Check if a position is inside any string region
-static inline bool isInsideString(const size_t pos, const std::vector<StringRegion>& regions)
-{
-    for (const auto& region : regions) {
-        if (pos >= region.start && pos < region.end) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Add a single hash mapping from full store paths
@@ -671,47 +700,14 @@ static std::vector<std::byte> patchSource(const std::span<const std::byte> conte
     }
 
     // === STRING-AWARE CONTENT PATCHING ===
-    // Patch additional paths (like /nix/var/) only inside string literals
-    // Uses source-highlight with the pre-detected language
-    if (!addPrefixToPaths.empty() && !langFile.empty() && !sourceHighlightDataDir.empty()) {
-        // Get string regions using source-highlight with the detected language
-        std::vector<StringRegion> stringRegions = getStringRegions(str, langFile);
+    // Use one-pass approach with PreFormatter for content after shebang
+    if (!langFile.empty() && !sourceHighlightDataDir.empty()) {
+        std::string afterShebang = str.substr(contentStart);
+        std::string patchedContent = patchSourceWithHighlighter(afterShebang, langFile);
 
-        if (!stringRegions.empty()) {
-            debug("  patching additional paths in %zu string regions\n", stringRegions.size());
-
-            for (const auto& pattern : addPrefixToPaths) {
-                size_t pos = contentStart;  // Skip shebang line if present
-                while ((pos = str.find(pattern, pos)) != std::string::npos) {
-                    // Only patch if inside a string literal
-                    if (isInsideString(pos, stringRegions)) {
-                        // Check not already prefixed
-                        bool alreadyPrefixed = (pos >= prefix.length() &&
-                            str.substr(pos - prefix.length(), prefix.length()) == prefix);
-
-                        if (!alreadyPrefixed) {
-                            debug("  patching %s at position %zu (inside string)\n",
-                                  pattern.c_str(), pos);
-                            str.insert(pos, prefix);
-
-                            // Adjust all subsequent regions for the insertion
-                            for (auto& region : stringRegions) {
-                                if (region.start > pos) {
-                                    region.start += prefix.length();
-                                }
-                                if (region.end > pos) {
-                                    region.end += prefix.length();
-                                }
-                            }
-                            pos += prefix.length();
-                            modified = true;
-                        }
-                    }
-                    pos += pattern.length();
-                }
-            }
-        } else {
-            debug("  no string regions found, skipping additional path patching\n");
+        if (patchedContent != afterShebang) {
+            str = str.substr(0, contentStart) + patchedContent;
+            modified = true;
         }
     }
 
