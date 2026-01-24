@@ -317,9 +317,9 @@ void NarProcessor::process()
                 return node;
             }
         ) &
-        // Patch filter (parallel): patch content in parallel
+        // Patch filter (serial): patch content serially for now
         tbb::make_filter<NarNode, NarNode>(
-            tbb::filter_mode::parallel,
+            tbb::filter_mode::serial_in_order,
             [this](NarNode node) -> NarNode {
                 if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
                     node.content = contentPatcher_(node.content, node.executable, node.path);
