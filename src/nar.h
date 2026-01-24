@@ -1,5 +1,5 @@
 /*
- * NAR (Nix ARchive) format streaming processor
+ * NAR (Nix ARchive) format streaming processor with TBB parallel_pipeline
  *
  * NAR format:
  * - All strings are length-prefixed (64-bit LE) and padded to 8-byte boundary
@@ -7,9 +7,11 @@
  * - Node: "(" type {regular|symlink|directory} ... ")"
  *
  * Processing architecture:
- * - C++23 generator yields NarNode items as parsed (no tree in memory)
- * - Serial processing: parse → patch → write
- * - Memory: O(max_file) - one file content in memory at a time
+ * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
+ * - Generator yields NarNode items as parsed (no tree in memory)
+ * - Parallel patching with automatic backpressure (8 tokens in flight)
+ * - Order preserved via serial_in_order filter modes
+ * - Memory: O(8 × max_file) - bounded by token count
  */
 
 #ifndef NAR_H
@@ -21,9 +23,12 @@
 #include <generator>
 #include <istream>
 #include <ostream>
+#include <ranges>
 #include <span>
 #include <string>
 #include <vector>
+
+#include <oneapi/tbb/parallel_pipeline.h>
 
 namespace nar {
 
@@ -101,6 +106,8 @@ private:
     ContentPatcher contentPatcher_;
     SymlinkPatcher symlinkPatcher_;
     Stats stats_;
+    std::generator<NarNode> parseGen_;
+    std::ranges::iterator_t<std::generator<NarNode>> it_;
 };
 
 } // namespace nar

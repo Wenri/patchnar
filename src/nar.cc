@@ -1,10 +1,12 @@
 /*
- * NAR (Nix ARchive) format streaming implementation
+ * NAR (Nix ARchive) format streaming implementation with TBB parallel_pipeline
  *
- * Processing architecture:
- * - C++23 generator yields NarNode items as parsed (no tree allocation)
- * - Serial processing: parse → patch → write
- * - Memory: O(max_file) - one file content in memory at a time
+ * Parallel pipeline architecture:
+ * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
+ * - Generator yields NarNode items as parsed (no tree allocation)
+ * - Parallel patching with automatic backpressure (8 tokens in flight)
+ * - Order preserved via serial_in_order filter modes
+ * - Memory: O(8 × max_file) - bounded by token count
  */
 
 #include "nar.h"
@@ -25,7 +27,7 @@ static constexpr const char* NAR_MAGIC = "nix-archive-1";
 // ============================================================================
 
 NarProcessor::NarProcessor(std::istream& in, std::ostream& out)
-    : in_(in), out_(out)
+    : in_(in), out_(out), parseGen_(parse()), it_(parseGen_.begin())
 {
 }
 
@@ -296,21 +298,47 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    // Create generator and iterate (generator is single-pass, must only call begin() once)
-    auto gen = parse();
-    for (auto it = gen.begin(); it != gen.end(); ++it) {
-        NarNode node = std::move(*it);
-
-        // Patch
-        if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
-            node.content = contentPatcher_(node.content, node.executable, node.path);
-        } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
-            node.target = symlinkPatcher_(node.target);
-        }
-
-        // Write
-        writeNode(node);
-    }
+    // TBB parallel pipeline with 8 tokens for backpressure
+    // - Parse filter: serial (generator is not thread-safe)
+    // - Patch filter: parallel (ELF patching is CPU-intensive)
+    // - Write filter: serial (output stream is not thread-safe)
+    tbb::parallel_pipeline(
+        8,  // max tokens in flight
+        // Parse filter (serial_in_order): yields nodes from generator
+        tbb::make_filter<void, NarNode>(
+            tbb::filter_mode::serial_in_order,
+            [this](tbb::flow_control& fc) -> NarNode {
+                if (it_ == parseGen_.end()) {
+                    fc.stop();
+                    return NarNode{};
+                }
+                NarNode node = std::move(*it_);
+                ++it_;
+                return node;
+            }
+        ) &
+        // Patch filter (parallel): patch content in parallel
+        tbb::make_filter<NarNode, NarNode>(
+            tbb::filter_mode::parallel,
+            [this](NarNode node) -> NarNode {
+                if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
+                    node.content = contentPatcher_(node.content, node.executable, node.path);
+                } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
+                    node.target = symlinkPatcher_(node.target);
+                }
+                return node;
+            }
+        ) &
+        // Write filter (serial_in_order): write nodes to output
+        tbb::make_filter<NarNode, void>(
+            tbb::filter_mode::serial_in_order,
+            [this](NarNode node) {
+                if (node.type != NarNode::Type::Invalid) {
+                    writeNode(node);
+                }
+            }
+        )
+    );
 
     out_.flush();
 }
