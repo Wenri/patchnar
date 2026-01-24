@@ -57,53 +57,34 @@ struct StringRegion {
     size_t end;    // Ending position in the content
 };
 
-// ============================================================================
-// Tokenizer - Wrapper for source-highlight
-// ============================================================================
-
-class Tokenizer {
-public:
-    explicit Tokenizer(const std::string& dataDir) : dataDir_(dataDir) {}
-
-    // Detect language from filename and/or content
-    // Returns .lang filename (e.g., "sh.lang") or empty string
-    std::string detectLanguage(const std::string& filename, const std::string& content);
-
-    // Get string literal regions in source code
-    // Returns empty vector if tokenization fails
-    std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile);
-
-private:
-    std::string dataDir_;
-
-    // Custom formatter that captures string literal positions
-    class StringCapture : public srchilite::Formatter {
-    public:
-        std::vector<StringRegion>& regions;
-        size_t lineOffset = 0;
-
-        explicit StringCapture(std::vector<StringRegion>& r) : regions(r) {}
-
-        void format(const std::string& s, const srchilite::FormatterParams* params) override {
-            if (params && params->start >= 0) {
-                size_t start = lineOffset + static_cast<size_t>(params->start);
-                regions.push_back({start, start + s.length()});
-            }
-        }
-    };
-
-    // Null formatter that discards everything
-    class NullFormatter : public srchilite::Formatter {
-    public:
-        void format(const std::string&, const srchilite::FormatterParams*) override {}
-    };
-};
-
-// Global tokenizer instance (initialized in main when source-highlight data dir is set)
-static std::unique_ptr<Tokenizer> tokenizer;
-
 // Source-highlight data directory (set via --source-highlight-data-dir)
 static std::string sourceHighlightDataDir;
+
+// Custom formatter that captures string literal positions
+class StringCapture : public srchilite::Formatter {
+public:
+    std::vector<StringRegion>& regions;
+    size_t lineOffset = 0;
+
+    explicit StringCapture(std::vector<StringRegion>& r) : regions(r) {}
+
+    void format(const std::string& s, const srchilite::FormatterParams* params) override {
+        if (params && params->start >= 0) {
+            size_t start = lineOffset + static_cast<size_t>(params->start);
+            regions.push_back({start, start + s.length()});
+        }
+    }
+};
+
+// Null formatter that discards everything
+class NullFormatter : public srchilite::Formatter {
+public:
+    void format(const std::string&, const srchilite::FormatterParams*) override {}
+};
+
+// Forward declarations
+static std::string detectLanguage(const std::string& filename, const std::string& content);
+static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile);
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -208,14 +189,14 @@ static bool shouldSkipByExtension(const std::string& filename)
     return !ext.empty() && SKIP_EXTENSIONS.count(ext) > 0;
 }
 
-// Tokenizer::detectLanguage - Detect language from filename and/or content
+// Detect language from filename and/or content
 // Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
-// Detection priority: 1) Filename-based (LangMap) 2) Content-based (LanguageInfer)
-// Thread-safe: uses mutex to protect source-highlight access (flex uses global state)
-std::string Tokenizer::detectLanguage(const std::string& filename, const std::string& content)
+static std::string detectLanguage(const std::string& filename, const std::string& content)
 {
+    if (sourceHighlightDataDir.empty()) return "";
+
     try {
-        srchilite::LangMap langMap(dataDir_, "lang.map");
+        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
 
         // 1. Try filename-based detection first
         std::string langFile = langMap.getMappedFileNameFromFileName(filename);
@@ -247,15 +228,13 @@ std::string Tokenizer::detectLanguage(const std::string& filename, const std::st
     return "";
 }
 
-// Tokenizer::getStringRegions - Get string literal regions in source code
-// Takes the .lang file directly (already detected by detectLanguage)
+// Get string literal regions in source code
 // Returns empty vector if language is empty or processing fails
-// Thread-safe: uses mutex to protect source-highlight access (flex uses global state)
-std::vector<StringRegion> Tokenizer::getStringRegions(const std::string& content, const std::string& langFile)
+static std::vector<StringRegion> getStringRegions(const std::string& content, const std::string& langFile)
 {
     std::vector<StringRegion> regions;
 
-    if (langFile.empty()) {
+    if (langFile.empty() || sourceHighlightDataDir.empty()) {
         return regions;
     }
 
@@ -268,7 +247,7 @@ std::vector<StringRegion> Tokenizer::getStringRegions(const std::string& content
 
         // Get the highlight state for the detected language
         srchilite::SourceHighlighter highlighter(
-            langDefManager.getHighlightState(dataDir_, langFile));
+            langDefManager.getHighlightState(sourceHighlightDataDir, langFile));
 
         // Disable optimization to get accurate position information
         highlighter.setOptimize(false);
@@ -686,9 +665,9 @@ static std::vector<std::byte> patchSource(std::span<const std::byte> content, co
     // === STRING-AWARE CONTENT PATCHING ===
     // Patch additional paths (like /nix/var/) only inside string literals
     // Uses source-highlight with the pre-detected language
-    if (!addPrefixToPaths.empty() && !langFile.empty() && tokenizer) {
+    if (!addPrefixToPaths.empty() && !langFile.empty() && !sourceHighlightDataDir.empty()) {
         // Get string regions using source-highlight with the detected language
-        std::vector<StringRegion> stringRegions = tokenizer->getStringRegions(str, langFile);
+        std::vector<StringRegion> stringRegions = getStringRegions(str, langFile);
 
         if (!stringRegions.empty()) {
             debug("  patching additional paths in %zu string regions\n", stringRegions.size());
@@ -774,10 +753,10 @@ static std::vector<std::byte> patchContent(
             }
 
             // Content-based detection only for small files with shebang
-            if (tokenizer && hasShebang(content)) {
+            if (!sourceHighlightDataDir.empty() && hasShebang(content)) {
                 if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
                     std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-                    langFile = tokenizer->detectLanguage(filename, contentStr);
+                    langFile = detectLanguage(filename, contentStr);
                 } else {
                     debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
                 }
@@ -896,11 +875,6 @@ int main(int argc, char** argv)
         std::cerr << "Error: --prefix is required\n";
         showHelp(argv[0]);
         return 1;
-    }
-
-    // Initialize tokenizer if source-highlight data dir is set
-    if (!sourceHighlightDataDir.empty()) {
-        tokenizer = std::make_unique<Tokenizer>(sourceHighlightDataDir);
     }
 
     debug("patchnar: prefix=%s\n", prefix.c_str());
