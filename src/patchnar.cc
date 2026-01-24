@@ -363,7 +363,7 @@ static bool hasShebang(std::span<const std::byte> content)
 {
     if (content.size() < 2)
         return false;
-    return static_cast<char>(content[0]) == '#' && static_cast<char>(content[1]) == '!';
+    return std::to_integer<char>(content[0]) == '#' && std::to_integer<char>(content[1]) == '!';
 }
 
 // Check if ELF is 32-bit
@@ -371,7 +371,7 @@ static bool isElf32(std::span<const std::byte> content)
 {
     if (content.size() < EI_CLASS + 1)
         return false;
-    return static_cast<unsigned char>(content[EI_CLASS]) == ELFCLASS32;
+    return std::to_integer<unsigned char>(content[EI_CLASS]) == ELFCLASS32;
 }
 
 // Replace occurrences of old path with new path in string
