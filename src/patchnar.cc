@@ -340,8 +340,8 @@ static void applyHashMappings(std::vector<std::byte>& content)
     }
 
     if (modified) {
-        auto* p = reinterpret_cast<const std::byte*>(str.data());
-        content.assign(p, p + str.size());
+        auto bytes = std::as_bytes(std::span(str));
+        content.assign(bytes.begin(), bytes.end());
     }
 }
 
@@ -556,10 +556,8 @@ static std::vector<std::byte> patchElfContent(
         elfFile.rewriteSections();
 
         // Convert back to std::byte
-        auto& uc = *elfFile.fileContents;
-        return std::vector<std::byte>(
-            reinterpret_cast<const std::byte*>(uc.data()),
-            reinterpret_cast<const std::byte*>(uc.data()) + uc.size());
+        auto bytes = std::as_bytes(std::span(*elfFile.fileContents));
+        return std::vector<std::byte>(bytes.begin(), bytes.end());
     } catch (const std::exception& e) {
         debug("  ELF patch failed: %s\n", e.what());
         // Return original content on error
