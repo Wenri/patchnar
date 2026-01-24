@@ -23,11 +23,12 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
-#include <set>
+#include <unordered_set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Source-highlight includes for string literal tokenization (required)
@@ -93,7 +94,7 @@ static std::map<std::string, std::string> hashMappings;
 
 // Extensions to skip entirely (don't even call source-highlight)
 // These are documentation, binary, or compressed files that never need patching
-static const std::set<std::string> SKIP_EXTENSIONS = {
+static const std::unordered_set<std::string> SKIP_EXTENSIONS = {
     // Documentation
     ".html", ".htm", ".xhtml", ".css", ".svg",
     // Images
@@ -146,7 +147,7 @@ static const std::unordered_map<std::string, std::string> EXTENSION_TO_LANG = {
 
 // Whitelist of language files worth tokenizing for string literal patching
 // DEBUG: Only shell scripts for now to isolate performance issues
-static const std::set<std::string> PATCHABLE_LANG_FILES = {
+static const std::unordered_set<std::string> PATCHABLE_LANG_FILES = {
     "sh.lang",
     "zsh.lang",
 };
@@ -310,13 +311,13 @@ static bool isInsideString(size_t pos, const std::vector<StringRegion>& regions)
 static void addMapping(const std::string& oldPath, const std::string& newPath)
 {
     // Extract basename (everything after last /)
-    auto oldBase = oldPath.substr(oldPath.rfind('/') + 1);
-    auto newBase = newPath.substr(newPath.rfind('/') + 1);
+    std::string oldBase = oldPath.substr(oldPath.rfind('/') + 1);
+    std::string newBase = newPath.substr(newPath.rfind('/') + 1);
 
     // Validate same length (required for safe substitution in NAR)
     if (oldBase.length() == newBase.length()) {
-        hashMappings[oldBase] = newBase;
         debug("  mapping: %s -> %s\n", oldBase.c_str(), newBase.c_str());
+        hashMappings.emplace(std::move(oldBase), std::move(newBase));
     } else {
         std::cerr << "patchnar: warning: skipping mapping " << oldBase
                   << " -> " << newBase << " (length mismatch: "
@@ -400,120 +401,118 @@ static bool isElf32(std::span<const std::byte> content)
 }
 
 // Replace occurrences of old path with new path in string
-static std::string replaceAll(const std::string& str,
+static std::string replaceAll(std::string str,
                               const std::string& from,
                               const std::string& to)
 {
     if (from.empty())
         return str;
 
-    std::string result = str;
     size_t pos = 0;
-    while ((pos = result.find(from, pos)) != std::string::npos) {
-        result.replace(pos, from.length(), to);
+    while ((pos = str.find(from, pos)) != std::string::npos) {
+        str.replace(pos, from.length(), to);
         pos += to.length();
     }
-    return result;
+    return str;
 }
 
 // Apply hash mappings to a string (for symlinks, etc.)
-static std::string applyHashMappingsToString(const std::string& str)
+// Returns the original string if no mappings match (avoids copy)
+static std::string applyHashMappingsToString(std::string str)
 {
     if (hashMappings.empty()) return str;
 
-    std::string result = str;
     for (const auto& [oldHash, newHash] : hashMappings) {
         size_t pos = 0;
-        while ((pos = result.find(oldHash, pos)) != std::string::npos) {
-            result.replace(pos, oldHash.length(), newHash);
+        while ((pos = str.find(oldHash, pos)) != std::string::npos) {
+            str.replace(pos, oldHash.length(), newHash);
             pos += newHash.length();
         }
     }
-    return result;
+    return str;
 }
 
 // Patch symlink target
 static std::string patchSymlink(const std::string& target)
 {
-    std::string newTarget = target;
+    std::string result = target;
 
     // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
     // This is the same order as transformRpathEntry to ensure consistency
     // Replace old glibc with Android glibc (for symlinks like ld.so)
     if (!oldGlibcPath.empty()) {
         // Try full path first (for absolute symlinks)
-        if (newTarget.find(oldGlibcPath) != std::string::npos) {
-            newTarget = replaceAll(newTarget, oldGlibcPath, glibcPath);
+        if (result.find(oldGlibcPath) != std::string::npos) {
+            result = replaceAll(std::move(result), oldGlibcPath, glibcPath);
         } else {
             // For relative symlinks (e.g., ../../hash-glibc-version/lib/...)
             // Extract basenames and try to match those
-            auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
-            auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
-            if (!oldBase.empty() && newTarget.find(oldBase) != std::string::npos) {
-                newTarget = replaceAll(newTarget, oldBase, newBase);
+            const auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
+            const auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
+            if (!oldBase.empty() && result.find(oldBase) != std::string::npos) {
+                result = replaceAll(std::move(result), oldBase, newBase);
             }
         }
     }
 
     // Then apply hash mappings for inter-package references
-    newTarget = applyHashMappingsToString(newTarget);
+    result = applyHashMappingsToString(std::move(result));
 
     // Finally add prefix to /nix/store paths
-    if (newTarget.rfind("/nix/store/", 0) == 0) {
-        newTarget = prefix + newTarget;
+    if (result.rfind("/nix/store/", 0) == 0) {
+        result.insert(0, prefix);
     }
 
-    if (newTarget != target) {
-        debug("  symlink: %s -> %s\n", target.c_str(), newTarget.c_str());
+    if (result != target) {
+        debug("  symlink: %s -> %s\n", target.c_str(), result.c_str());
     }
-    return newTarget;
+    return result;
 }
 
 // Transform a single RPATH entry
-static std::string transformRpathEntry(const std::string& entry)
+static std::string transformRpathEntry(std::string entry)
 {
-    std::string result = entry;
-
     // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
     // because hash mappings would change the path and prevent matching
     // gcc-lib is handled by hash mapping (same package, different hash)
 
     // Replace old glibc with new glibc (Android glibc)
-    if (!oldGlibcPath.empty() && result.find(oldGlibcPath) != std::string::npos) {
-        result = replaceAll(result, oldGlibcPath, glibcPath);
+    if (!oldGlibcPath.empty() && entry.find(oldGlibcPath) != std::string::npos) {
+        entry = replaceAll(std::move(entry), oldGlibcPath, glibcPath);
     }
 
     // Then apply hash mappings for inter-package references (including gcc-lib)
-    result = applyHashMappingsToString(result);
+    entry = applyHashMappingsToString(std::move(entry));
 
     // Add prefix to /nix/store paths (for Android glibc and other libs)
-    if (result.rfind("/nix/store/", 0) == 0) {
-        result = prefix + result;
+    if (entry.rfind("/nix/store/", 0) == 0) {
+        entry.insert(0, prefix);
     }
 
-    return result;
+    return entry;
 }
 
 // Build new RPATH from old RPATH by transforming each entry
 static std::string buildNewRpath(const std::string& oldRpath)
 {
     if (oldRpath.empty()) {
-        return "";
+        return {};
     }
 
     std::string newRpath;
+    newRpath.reserve(oldRpath.size() + prefix.size() * 4);  // Estimate with prefix additions
+
     std::string current;
 
     for (size_t i = 0; i <= oldRpath.size(); ++i) {
         if (i == oldRpath.size() || oldRpath[i] == ':') {
             if (!current.empty()) {
-                std::string transformed = transformRpathEntry(current);
                 if (!newRpath.empty()) {
                     newRpath += ':';
                 }
-                newRpath += transformed;
+                newRpath += transformRpathEntry(std::move(current));
+                current.clear();
             }
-            current.clear();
         } else {
             current += oldRpath[i];
         }
@@ -558,15 +557,15 @@ static std::vector<std::byte> patchElfContent(
 
             // Replace old glibc interpreter with Android glibc
             if (!oldGlibcPath.empty() && newInterp.find(oldGlibcPath) != std::string::npos) {
-                newInterp = replaceAll(newInterp, oldGlibcPath, glibcPath);
+                newInterp = replaceAll(std::move(newInterp), oldGlibcPath, glibcPath);
             }
 
             // Then apply hash mappings for inter-package references
-            newInterp = applyHashMappingsToString(newInterp);
+            newInterp = applyHashMappingsToString(std::move(newInterp));
 
             // Add prefix to /nix/store interpreters (needed for kernel to find ld.so)
             if (newInterp.rfind("/nix/store/", 0) == 0) {
-                newInterp = prefix + newInterp;
+                newInterp.insert(0, prefix);
             }
 
             if (newInterp != interp) {
@@ -629,11 +628,11 @@ static std::vector<std::byte> patchSource(std::span<const std::byte> content, co
             // Replace old glibc paths (gcc-lib handled by hash mapping)
             std::string newShebang = shebang;
             if (!oldGlibcPath.empty()) {
-                newShebang = replaceAll(newShebang, oldGlibcPath, glibcPath);
+                newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
             }
 
             // Apply hash mappings for inter-package references
-            newShebang = applyHashMappingsToString(newShebang);
+            newShebang = applyHashMappingsToString(std::move(newShebang));
 
             // Add prefix to remaining /nix/store paths
             // Look for /nix/store/ after #!
@@ -708,10 +707,11 @@ static std::vector<std::byte> patchSource(std::span<const std::byte> content, co
     }
 
     if (modified) {
-        auto* p = reinterpret_cast<const std::byte*>(str.data());
-        return std::vector<std::byte>(p, p + str.size());
+        std::vector<std::byte> result(str.size());
+        std::memcpy(result.data(), str.data(), str.size());
+        return result;
     }
-    return std::vector<std::byte>(content.begin(), content.end());
+    return {content.begin(), content.end()};
 }
 
 // Main content patcher
@@ -803,9 +803,7 @@ static void showHelp(const char* progName)
               << "  --source-highlight-data-dir DIR\n"
               << "                       Path to source-highlight data files (.lang files)\n"
               << "  --debug              Enable debug output\n"
-              << "  --help               Show this help\n"
-              << "\n"
-              << "Thread count can be controlled via TBB_NUM_THREADS environment variable.\n";
+              << "  --help               Show this help\n";
 }
 
 int main(int argc, char** argv)

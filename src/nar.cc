@@ -1,12 +1,11 @@
 /*
- * NAR (Nix ARchive) format streaming implementation with TBB parallel_pipeline
+ * NAR (Nix ARchive) format streaming implementation
  *
- * Parallel pipeline architecture:
- * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
- * - Generator yields NarNode items as parsed (no tree allocation)
- * - Parallel patching with automatic backpressure (8 tokens in flight)
- * - Order preserved via serial_in_order filter modes
- * - Memory: O(8 × max_file) - bounded by token count
+ * Streaming architecture:
+ * - C++23 std::generator yields NarNode items as parsed (no tree allocation)
+ * - Serial processing loop for patching and writing
+ * - Order preserved naturally through sequential iteration
+ * - Memory: O(max_file) - one file in memory at a time
  */
 
 #include "nar.h"
@@ -220,18 +219,18 @@ std::generator<NarNode> NarProcessor::parseDirectory(std::string path)
 
         std::string childPath = path.empty() ? name : path + "/" + name;
 
-        co_yield NarNode{.type = NarNode::Type::EntryStart, .name = name, .path = childPath};
+        co_yield NarNode{.type = NarNode::Type::EntryStart, .name = std::move(name), .path = childPath};
 
         for (auto&& node : parseNode(childPath)) {
             co_yield std::move(node);
         }
 
         expectString(")");
-        co_yield NarNode{.type = NarNode::Type::EntryEnd, .path = childPath};
+        co_yield NarNode{.type = NarNode::Type::EntryEnd, .path = std::move(childPath)};
     }
 
     stats_.directoriesProcessed++;
-    co_yield NarNode{.type = NarNode::Type::DirectoryEnd, .path = path};
+    co_yield NarNode{.type = NarNode::Type::DirectoryEnd, .path = std::move(path)};
 }
 
 // ============================================================================
