@@ -27,7 +27,7 @@ static constexpr const char* NAR_MAGIC = "nix-archive-1";
 // ============================================================================
 
 NarProcessor::NarProcessor(std::istream& in, std::ostream& out)
-    : in_(in), out_(out), parseGen_(parse()), it_(parseGen_.begin())
+    : in_(in), out_(out), parseGen_(parse())
 {
 }
 
@@ -291,54 +291,26 @@ void NarProcessor::writeNode(const NarNode& node)
 }
 
 // ============================================================================
-// Main Processing Pipeline (TBB parallel_pipeline)
+// Main Processing Loop (Serial)
 // ============================================================================
 
 void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    // TBB parallel pipeline with 8 tokens for backpressure
-    // - Parse filter: serial (generator is not thread-safe)
-    // - Patch filter: parallel (ELF patching is CPU-intensive)
-    // - Write filter: serial (output stream is not thread-safe)
-    tbb::parallel_pipeline(
-        8,  // max tokens in flight
-        // Parse filter (serial_in_order): yields nodes from generator
-        tbb::make_filter<void, NarNode>(
-            tbb::filter_mode::serial_in_order,
-            [this](tbb::flow_control& fc) -> NarNode {
-                if (it_ == parseGen_.end()) {
-                    fc.stop();
-                    return NarNode{};
-                }
-                NarNode node = std::move(*it_);
-                ++it_;
-                return node;
-            }
-        ) &
-        // Patch filter (serial): patch content serially for now
-        tbb::make_filter<NarNode, NarNode>(
-            tbb::filter_mode::serial_in_order,
-            [this](NarNode node) -> NarNode {
-                if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
-                    node.content = contentPatcher_(node.content, node.executable, node.path);
-                } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
-                    node.target = symlinkPatcher_(node.target);
-                }
-                return node;
-            }
-        ) &
-        // Write filter (serial_in_order): write nodes to output
-        tbb::make_filter<NarNode, void>(
-            tbb::filter_mode::serial_in_order,
-            [this](NarNode node) {
-                if (node.type != NarNode::Type::Invalid) {
-                    writeNode(node);
-                }
-            }
-        )
-    );
+    // Simple serial processing loop
+    // TBB parallel_pipeline disabled for now due to ordering issues
+    for (auto&& node : parseGen_) {
+        // Patch content
+        if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
+            node.content = contentPatcher_(node.content, node.executable, node.path);
+        } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
+            node.target = symlinkPatcher_(node.target);
+        }
+
+        // Write node
+        writeNode(node);
+    }
 
     out_.flush();
 }
