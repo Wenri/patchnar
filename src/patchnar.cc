@@ -58,11 +58,9 @@ struct StringRegion {
     size_t end;    // Ending position in the content
 };
 
-// Source-highlight data directory (compile-time default, can be overridden)
-#ifndef SOURCE_HIGHLIGHT_DATA_DIR
-#define SOURCE_HIGHLIGHT_DATA_DIR ""
-#endif
-static std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
+// Source-highlight data directory (set at compile time via configure)
+// configure.ac auto-detects from pkg-config or uses --with-source-highlight-data-dir
+static const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
 
 // Custom formatter that captures string literal positions
 class StringCapture : public srchilite::Formatter {
