@@ -304,7 +304,7 @@ void NarProcessor::process()
         if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
             node.content = contentPatcher_(node.content, node.executable, node.path);
         } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
-            node.target = symlinkPatcher_(node.target);
+            node.target = symlinkPatcher_(std::move(node.target));
         }
 
         // Write node

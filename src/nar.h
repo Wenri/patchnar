@@ -33,7 +33,7 @@ namespace nar {
 
 using ContentPatcher = std::function<std::vector<std::byte>(
     std::span<const std::byte>, bool, const std::string&)>;
-using SymlinkPatcher = std::function<std::string(const std::string&)>;
+using SymlinkPatcher = std::function<std::string(std::string)>;
 
 // ============================================================================
 // NarNode - Data node yielded by the generator
