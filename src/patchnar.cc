@@ -231,26 +231,11 @@ static std::string getLangFromExtension(const std::string& filename)
     return (it != EXTENSION_TO_LANG.end()) ? it->second : "";
 }
 
-// Check if file should be skipped based on extension OR size
-// - Non-patchable extensions (.html, .png) are always skipped
-// - Large files without a patchable extension mapping are skipped
-//   (would need content-based detection which is expensive)
-static bool shouldSkipByExtension(const std::string& filename, size_t size)
+// Check if file should be skipped based on extension (non-patchable files)
+static bool shouldSkipByExtension(const std::string& filename)
 {
     std::string ext = getExtension(filename);
-
-    // Skip non-patchable extensions
-    if (!ext.empty() && SKIP_EXTENSIONS.count(ext) > 0) {
-        return true;
-    }
-
-    // Skip large files that would need content-based detection
-    // (extension not in EXTENSION_TO_LANG means we'd need source-highlight)
-    if (EXTENSION_TO_LANG.count(ext) == 0 && size > MAX_CONTENT_DETECT_SIZE) {
-        return true;
-    }
-
-    return false;
+    return !ext.empty() && SKIP_EXTENSIONS.count(ext) > 0;
 }
 
 // Tokenizer::detectLanguage - Detect language from filename and/or content
@@ -810,20 +795,25 @@ static std::vector<std::byte> patchContent(
             result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
                 content, executable);
         }
-    } else if (shouldSkipByExtension(filename, content.size())) {
-        // Fast path: skip non-patchable extensions OR large extensionless non-ELF files
-        debug("  skipping %s (skip extension or large extensionless)\n", path.c_str());
+    } else if (shouldSkipByExtension(filename)) {
+        // Fast path: skip non-patchable extensions (.html, .png, etc.)
+        debug("  skipping %s (non-patchable extension)\n", path.c_str());
         result = std::vector<std::byte>(content.begin(), content.end());
         applyHashMappings(result);
         return result;
     } else {
-        // Fast path 2: extension-based language detection (O(1) hash lookup)
+        // Try extension-based language detection first (O(1) hash lookup)
         std::string langFile = getLangFromExtension(filename);
 
-        // Fallback: content-based detection for small extensionless files with shebang
+        // Fallback: content-based detection only for small files with shebang
+        // Large files without extension mapping are skipped (too expensive)
         if (langFile.empty() && tokenizer && hasShebang(content)) {
-            std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-            langFile = tokenizer->detectLanguage(filename, contentStr);
+            if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
+                std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
+                langFile = tokenizer->detectLanguage(filename, contentStr);
+            } else {
+                debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
+            }
         }
 
         // Only process if language is in our whitelist of patchable languages
