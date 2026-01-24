@@ -20,6 +20,15 @@ PKG_CHECK_MODULES([SOURCE_HIGHLIGHT], [source-highlight >= 3.0],
     [],
     [AC_MSG_ERROR([source-highlight >= 3.0 is required for language detection])])
 
+# Source-highlight data directory (contains .lang files)
+AC_ARG_WITH([source-highlight-data-dir],
+   AS_HELP_STRING([--with-source-highlight-data-dir=DIR], [Path to source-highlight data files]),
+   [SOURCE_HIGHLIGHT_DATA_DIR="$withval"],
+   [SOURCE_HIGHLIGHT_DATA_DIR=""]
+)
+AC_DEFINE_UNQUOTED([SOURCE_HIGHLIGHT_DATA_DIR], ["${SOURCE_HIGHLIGHT_DATA_DIR}"],
+    [Path to source-highlight data files (.lang files)])
+
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],
    AS_HELP_STRING([--with-page-size=SIZE], [Specify default pagesize (default auto)]),

@@ -23,6 +23,10 @@ gcc14Stdenv.mkDerivation {
     boost
     sourceHighlight
   ];
+  # Set source-highlight data directory at compile time
+  configureFlags = [
+    "--with-source-highlight-data-dir=${sourceHighlight}/share/source-highlight"
+  ];
   # Disable tests - some patchelf tests fail on aarch64 but patchnar works
   doCheck = false;
 }

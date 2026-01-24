@@ -58,8 +58,11 @@ struct StringRegion {
     size_t end;    // Ending position in the content
 };
 
-// Source-highlight data directory (set via --source-highlight-data-dir)
-static std::string sourceHighlightDataDir;
+// Source-highlight data directory (compile-time default, can be overridden)
+#ifndef SOURCE_HIGHLIGHT_DATA_DIR
+#define SOURCE_HIGHLIGHT_DATA_DIR ""
+#endif
+static std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
 
 // Custom formatter that captures string literal positions
 class StringCapture : public srchilite::Formatter {
@@ -800,8 +803,6 @@ static void showHelp(const char* progName)
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
               << "  --add-prefix-to PATH Path pattern to add prefix to in script strings\n"
               << "                       (e.g., /nix/var/). Can be specified multiple times.\n"
-              << "  --source-highlight-data-dir DIR\n"
-              << "                       Path to source-highlight data files (.lang files)\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -815,14 +816,13 @@ int main(int argc, char** argv)
         {"mappings",                 required_argument, nullptr, 'm'},
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
-        {"source-highlight-data-dir", required_argument, nullptr, 'D'},
         {"debug",                    no_argument,       nullptr, 'd'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr,                    0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:D:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'p':
             prefix = optarg;
@@ -853,9 +853,6 @@ int main(int argc, char** argv)
         }
         case 'A':
             addPrefixToPaths.push_back(optarg);
-            break;
-        case 'D':
-            sourceHighlightDataDir = optarg;
             break;
         case 'd':
             debugMode = true;
