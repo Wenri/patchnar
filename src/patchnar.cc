@@ -800,14 +800,7 @@ static std::vector<std::byte> patchContent(
     size_t lastSlash = path.rfind('/');
     filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 
-    // Fast path 1: skip non-patchable extensions OR large extensionless files
-    if (shouldSkipByExtension(filename, content.size())) {
-        debug("  skipping %s (skip extension or large extensionless)\n", path.c_str());
-        result = std::vector<std::byte>(content.begin(), content.end());
-        applyHashMappings(result);
-        return result;
-    }
-
+    // ELF check MUST come first - ELF files are often large and extensionless
     if (isElf(content)) {
         debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
         if (isElf32(content)) {
@@ -817,6 +810,12 @@ static std::vector<std::byte> patchContent(
             result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
                 content, executable);
         }
+    } else if (shouldSkipByExtension(filename, content.size())) {
+        // Fast path: skip non-patchable extensions OR large extensionless non-ELF files
+        debug("  skipping %s (skip extension or large extensionless)\n", path.c_str());
+        result = std::vector<std::byte>(content.begin(), content.end());
+        applyHashMappings(result);
+        return result;
     } else {
         // Fast path 2: extension-based language detection (O(1) hash lookup)
         std::string langFile = getLangFromExtension(filename);
