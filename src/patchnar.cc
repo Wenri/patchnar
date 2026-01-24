@@ -22,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <mutex>
 #include <set>
 #include <span>
@@ -113,6 +114,59 @@ static std::string sourceHighlightDataDir;
 // e.g., "abc123...-bash-5.2" -> "xyz789...-bash-5.2"
 static std::map<std::string, std::string> hashMappings;
 
+// Extensions to skip entirely (don't even call source-highlight)
+// These are documentation, binary, or compressed files that never need patching
+static const std::set<std::string> SKIP_EXTENSIONS = {
+    // Documentation
+    ".html", ".htm", ".xhtml", ".css", ".svg",
+    // Images
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp",
+    // Compressed/archives
+    ".xz", ".gz", ".bz2", ".zst", ".zip", ".tar", ".7z",
+    // Fonts
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    // Other binary/doc formats
+    ".pdf", ".ps", ".dvi", ".info", ".texi", ".texinfo",
+    // Haddock/Haskell docs
+    ".haddock", ".hi", ".o", ".a", ".so", ".dylib",
+};
+
+// Maximum file size for content-based language detection (shebang parsing)
+// Scripts needing patching are typically small; large extensionless files are data/binary
+static constexpr size_t MAX_CONTENT_DETECT_SIZE = 64 * 1024;  // 64KB
+
+// Map file extensions to source-highlight .lang files
+// This is the fast path - no source-highlight parsing needed
+static const std::unordered_map<std::string, std::string> EXTENSION_TO_LANG = {
+    // Shell
+    {".sh", "sh.lang"}, {".bash", "sh.lang"}, {".zsh", "zsh.lang"},
+    // Python
+    {".py", "python.lang"}, {".pyw", "python.lang"},
+    // Perl
+    {".pl", "perl.lang"}, {".pm", "perl.lang"},
+    // Ruby
+    {".rb", "ruby.lang"},
+    // Lua
+    {".lua", "lua.lang"},
+    // Tcl
+    {".tcl", "tcl.lang"},
+    // JavaScript/JSON
+    {".js", "javascript.lang"}, {".mjs", "javascript.lang"},
+    {".json", "json.lang"},
+    // Config files
+    {".conf", "conf.lang"}, {".cfg", "conf.lang"},
+    {".desktop", "desktop.lang"},
+    {".properties", "properties.lang"},
+    {".ini", "ini.lang"},
+    // Build systems
+    {".mk", "makefile.lang"},
+    {".m4", "m4.lang"},
+    // XML
+    {".xml", "xml.lang"},
+    // Awk
+    {".awk", "awk.lang"},
+};
+
 // Whitelist of language files worth tokenizing for string literal patching
 // These are languages where /nix/store paths commonly appear in string literals
 static const std::set<std::string> PATCHABLE_LANG_FILES = {
@@ -154,6 +208,49 @@ static void debug(const char* format, ...)
         vfprintf(stderr, format, ap);
         va_end(ap);
     }
+}
+
+// Get lowercase file extension (e.g., ".html", ".png")
+static std::string getExtension(const std::string& filename)
+{
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos || dot == 0) {
+        return "";
+    }
+    std::string ext = filename.substr(dot);
+    // Convert to lowercase
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext;
+}
+
+// Get .lang file from extension (fast path - O(1) hash lookup)
+static std::string getLangFromExtension(const std::string& filename)
+{
+    std::string ext = getExtension(filename);
+    auto it = EXTENSION_TO_LANG.find(ext);
+    return (it != EXTENSION_TO_LANG.end()) ? it->second : "";
+}
+
+// Check if file should be skipped based on extension OR size
+// - Non-patchable extensions (.html, .png) are always skipped
+// - Large files without a patchable extension mapping are skipped
+//   (would need content-based detection which is expensive)
+static bool shouldSkipByExtension(const std::string& filename, size_t size)
+{
+    std::string ext = getExtension(filename);
+
+    // Skip non-patchable extensions
+    if (!ext.empty() && SKIP_EXTENSIONS.count(ext) > 0) {
+        return true;
+    }
+
+    // Skip large files that would need content-based detection
+    // (extension not in EXTENSION_TO_LANG means we'd need source-highlight)
+    if (EXTENSION_TO_LANG.count(ext) == 0 && size > MAX_CONTENT_DETECT_SIZE) {
+        return true;
+    }
+
+    return false;
 }
 
 // Tokenizer::detectLanguage - Detect language from filename and/or content
@@ -703,6 +800,14 @@ static std::vector<std::byte> patchContent(
     size_t lastSlash = path.rfind('/');
     filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 
+    // Fast path 1: skip non-patchable extensions OR large extensionless files
+    if (shouldSkipByExtension(filename, content.size())) {
+        debug("  skipping %s (skip extension or large extensionless)\n", path.c_str());
+        result = std::vector<std::byte>(content.begin(), content.end());
+        applyHashMappings(result);
+        return result;
+    }
+
     if (isElf(content)) {
         debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
         if (isElf32(content)) {
@@ -713,11 +818,12 @@ static std::vector<std::byte> patchContent(
                 content, executable);
         }
     } else {
-        // For all non-ELF files, try language detection
-        std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-        std::string langFile;
+        // Fast path 2: extension-based language detection (O(1) hash lookup)
+        std::string langFile = getLangFromExtension(filename);
 
-        if (tokenizer) {
+        // Fallback: content-based detection for small extensionless files with shebang
+        if (langFile.empty() && tokenizer && hasShebang(content)) {
+            std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
             langFile = tokenizer->detectLanguage(filename, contentStr);
         }
 
