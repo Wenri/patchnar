@@ -435,41 +435,36 @@ static std::string applyHashMappingsToString(std::string str)
     return str;
 }
 
-// Patch symlink target
-static std::string patchSymlink(const std::string& target)
+// Patch symlink target (takes by value to allow move semantics)
+static std::string patchSymlink(std::string target)
 {
-    std::string result = target;
-
     // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
     // This is the same order as transformRpathEntry to ensure consistency
     // Replace old glibc with Android glibc (for symlinks like ld.so)
     if (!oldGlibcPath.empty()) {
         // Try full path first (for absolute symlinks)
-        if (result.find(oldGlibcPath) != std::string::npos) {
-            result = replaceAll(std::move(result), oldGlibcPath, glibcPath);
+        if (target.find(oldGlibcPath) != std::string::npos) {
+            target = replaceAll(std::move(target), oldGlibcPath, glibcPath);
         } else {
             // For relative symlinks (e.g., ../../hash-glibc-version/lib/...)
             // Extract basenames and try to match those
             const auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
             const auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
-            if (!oldBase.empty() && result.find(oldBase) != std::string::npos) {
-                result = replaceAll(std::move(result), oldBase, newBase);
+            if (!oldBase.empty() && target.find(oldBase) != std::string::npos) {
+                target = replaceAll(std::move(target), oldBase, newBase);
             }
         }
     }
 
     // Then apply hash mappings for inter-package references
-    result = applyHashMappingsToString(std::move(result));
+    target = applyHashMappingsToString(std::move(target));
 
     // Finally add prefix to /nix/store paths
-    if (result.rfind("/nix/store/", 0) == 0) {
-        result.insert(0, prefix);
+    if (target.rfind("/nix/store/", 0) == 0) {
+        target.insert(0, prefix);
     }
 
-    if (result != target) {
-        debug("  symlink: %s -> %s\n", target.c_str(), result.c_str());
-    }
-    return result;
+    return target;
 }
 
 // Transform a single RPATH entry
