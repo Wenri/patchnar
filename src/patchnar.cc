@@ -44,7 +44,8 @@
 #include <boost/make_shared.hpp>
 
 // Configuration
-static std::string prefix;
+// Installation prefix set at compile time via configure --with-install-prefix
+static const std::string prefix = INSTALL_PREFIX;
 static std::string glibcPath;
 static std::string oldGlibcPath;
 static bool debugMode = false;
@@ -793,15 +794,18 @@ static void showHelp(const char* progName)
               << "Patch NAR stream for Android compatibility.\n"
               << "Reads NAR from stdin, writes patched NAR to stdout.\n"
               << "\n"
+              << "Compile-time settings:\n"
+              << "  prefix:              " << prefix << "\n"
+              << "  source-highlight:    " << sourceHighlightDataDir << "\n"
+              << "  add-prefix-to:       /nix/var/ (default)\n"
+              << "\n"
               << "Options:\n"
-              << "  --prefix PATH        Installation prefix (e.g., /data/.../usr)\n"
               << "  --glibc PATH         Android glibc store path\n"
               << "  --old-glibc PATH     Original glibc store path to replace\n"
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
-              << "  --add-prefix-to PATH Path pattern to add prefix to in script strings.\n"
-              << "                       Can be specified multiple times. Default: /nix/var/\n"
+              << "  --add-prefix-to PATH Additional path pattern to prefix in script strings\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -809,7 +813,6 @@ static void showHelp(const char* progName)
 int main(int argc, char** argv)
 {
     static struct option longOptions[] = {
-        {"prefix",                   required_argument, nullptr, 'p'},
         {"glibc",                    required_argument, nullptr, 'g'},
         {"old-glibc",                required_argument, nullptr, 'G'},
         {"mappings",                 required_argument, nullptr, 'm'},
@@ -821,11 +824,8 @@ int main(int argc, char** argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:g:G:m:s:A:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "g:G:m:s:A:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
-        case 'p':
-            prefix = optarg;
-            break;
         case 'g':
             glibcPath = optarg;
             break;
@@ -863,12 +863,6 @@ int main(int argc, char** argv)
             showHelp(argv[0]);
             return 1;
         }
-    }
-
-    if (prefix.empty()) {
-        std::cerr << "Error: --prefix is required\n";
-        showHelp(argv[0]);
-        return 1;
     }
 
     debug("patchnar: prefix=%s\n", prefix.c_str());

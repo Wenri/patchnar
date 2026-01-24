@@ -46,6 +46,22 @@ AC_MSG_RESULT([Using source-highlight data directory: $SOURCE_HIGHLIGHT_DATA_DIR
 AC_DEFINE_UNQUOTED([SOURCE_HIGHLIGHT_DATA_DIR], ["${SOURCE_HIGHLIGHT_DATA_DIR}"],
     [Path to source-highlight data files (.lang files)])
 
+# Installation prefix for Android patching (required)
+# This is the prefix added to ELF interpreter and RPATH paths
+AC_ARG_WITH([install-prefix],
+   AS_HELP_STRING([--with-install-prefix=PATH], [Installation prefix for Android patching (required)]),
+   [INSTALL_PREFIX="$withval"],
+   [INSTALL_PREFIX=""]
+)
+
+if test -z "$INSTALL_PREFIX"; then
+    AC_MSG_ERROR([--with-install-prefix is required (e.g., /data/data/com.termux.nix/files/usr)])
+fi
+
+AC_MSG_RESULT([Using installation prefix: $INSTALL_PREFIX])
+AC_DEFINE_UNQUOTED([INSTALL_PREFIX], ["${INSTALL_PREFIX}"],
+    [Installation prefix for Android patching])
+
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],
    AS_HELP_STRING([--with-page-size=SIZE], [Specify default pagesize (default auto)]),
