@@ -291,10 +291,6 @@ static std::string patchSourceWithHighlighter(
     const std::string& content,
     const std::string& langFile)
 {
-    if (langFile.empty() || sourceHighlightDataDir.empty()) {
-        return content;
-    }
-
     try {
         debug("  tokenizing and patching with %s\n", langFile.c_str());
 
@@ -323,23 +319,8 @@ static std::string patchSourceWithHighlighter(
         formatterManager.addFormatter("string", stringFormatter);
         highlighter.setFormatterManager(&formatterManager);
 
-        // Process line by line
-        std::istringstream inputStream(content);
-        std::string line;
-        bool firstLine = true;
-
-        while (std::getline(inputStream, line)) {
-            if (!firstLine) {
-                bufferedOutput.output("\n");
-            }
-            highlighter.highlightParagraph(line);
-            firstLine = false;
-        }
-
-        // Preserve trailing newline
-        if (!content.empty() && content.back() == '\n') {
-            bufferedOutput.output("\n");
-        }
+        // Process entire content at once
+        highlighter.highlightParagraph(content);
 
         return outputStream.str();
 
