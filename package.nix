@@ -12,7 +12,7 @@
 
 # Use GCC 14 stdenv for C++23 support (std::generator)
 gcc14Stdenv.mkDerivation {
-  pname = "patchelf";
+  pname = "patchnar";
   inherit version src;
   nativeBuildInputs = [
     autoreconfHook

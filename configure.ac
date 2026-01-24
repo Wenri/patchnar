@@ -1,6 +1,6 @@
 AC_PREREQ([2.62])
-AC_INIT([patchelf], m4_esyscmd([printf $(cat ./version)]))
-AC_CONFIG_SRCDIR([src/patchelf.cc])
+AC_INIT([patchnar], m4_esyscmd([printf $(cat ./version)]))
+AC_CONFIG_SRCDIR([src/patchnar.cc])
 AC_CONFIG_AUX_DIR([build-aux])
 AM_INIT_AUTOMAKE([1.11.1 -Wall -Werror dist-bzip2 foreign color-tests parallel-tests])
 AC_CONFIG_MACRO_DIR([m4])
