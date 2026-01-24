@@ -149,10 +149,21 @@ static const std::unordered_map<std::string, std::string> EXTENSION_TO_LANG = {
 };
 
 // Whitelist of language files worth tokenizing for string literal patching
-// DEBUG: Only shell scripts for now to isolate performance issues
+// These are script/config files that may contain /nix/store paths
 static const std::unordered_set<std::string> PATCHABLE_LANG_FILES = {
+    // Shell scripts (most common)
     "sh.lang",
     "zsh.lang",
+    // Other scripting languages
+    "perl.lang",
+    "python.lang",
+    "ruby.lang",
+    "tcl.lang",
+    "lua.lang",
+    "awk.lang",
+    // Build systems and config files
+    "makefile.lang",
+    "conf.lang",
 };
 
 static void debug(const char* format, ...)
