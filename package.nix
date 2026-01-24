@@ -5,7 +5,6 @@
   autoconf-archive,
   pkg-config,
   boost,
-  tbb,
   sourceHighlight,
   version,
   src,
@@ -22,7 +21,6 @@ gcc14Stdenv.mkDerivation {
   ];
   buildInputs = [
     boost
-    tbb
     sourceHighlight
   ];
   # Disable tests - some patchelf tests fail on aarch64 but patchnar works

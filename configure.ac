@@ -20,11 +20,6 @@ PKG_CHECK_MODULES([SOURCE_HIGHLIGHT], [source-highlight >= 3.0],
     [],
     [AC_MSG_ERROR([source-highlight >= 3.0 is required for language detection])])
 
-# Check for TBB library (required for patchnar parallel pipeline)
-PKG_CHECK_MODULES([TBB], [tbb >= 2020.0],
-    [],
-    [AC_MSG_ERROR([TBB >= 2020.0 is required for parallel pipeline])])
-
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],
    AS_HELP_STRING([--with-page-size=SIZE], [Specify default pagesize (default auto)]),

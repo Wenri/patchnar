@@ -20,8 +20,7 @@ endif
 bin_PROGRAMS = patchnar
 
 # patchnar uses patchelf as library (PATCHELF_AS_LIBRARY excludes main)
-# Links against source-highlight for language detection, TBB for parallel pipeline
+# Links against source-highlight for language detection
 patchnar_SOURCES = patchnar.cc nar.cc nar.h patchelf.cc elf.h patchelf.h
-patchnar_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS) $(TBB_CFLAGS) -pthread
-patchnar_LDFLAGS = -pthread
-patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS) $(TBB_LIBS)
+patchnar_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS)
+patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
