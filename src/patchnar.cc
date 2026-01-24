@@ -795,24 +795,28 @@ static std::vector<std::byte> patchContent(
             result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
                 content, executable);
         }
-    } else if (shouldSkipByExtension(filename)) {
-        // Fast path: skip non-patchable extensions (.html, .png, etc.)
-        debug("  skipping %s (non-patchable extension)\n", path.c_str());
-        result = std::vector<std::byte>(content.begin(), content.end());
-        applyHashMappings(result);
-        return result;
     } else {
         // Try extension-based language detection first (O(1) hash lookup)
         std::string langFile = getLangFromExtension(filename);
 
-        // Fallback: content-based detection only for small files with shebang
-        // Large files without extension mapping are skipped (too expensive)
-        if (langFile.empty() && tokenizer && hasShebang(content)) {
-            if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
-                std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-                langFile = tokenizer->detectLanguage(filename, contentStr);
-            } else {
-                debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
+        // If no extension mapping, check skip extensions and size threshold
+        if (langFile.empty()) {
+            if (shouldSkipByExtension(filename)) {
+                // Skip non-patchable extensions (.html, .png, etc.)
+                debug("  skipping %s (non-patchable extension)\n", path.c_str());
+                result = std::vector<std::byte>(content.begin(), content.end());
+                applyHashMappings(result);
+                return result;
+            }
+
+            // Content-based detection only for small files with shebang
+            if (tokenizer && hasShebang(content)) {
+                if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
+                    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
+                    langFile = tokenizer->detectLanguage(filename, contentStr);
+                } else {
+                    debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
+                }
             }
         }
 
