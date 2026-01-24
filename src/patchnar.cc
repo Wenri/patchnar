@@ -22,7 +22,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <unordered_map>
 #include <unordered_set>
 #include <span>
 #include <sstream>
@@ -43,8 +42,6 @@
 #include <srchilite/textstyleformatter.h>
 #include <srchilite/bufferedoutput.h>
 #include <srchilite/chartranslator.h>
-#include <boost/shared_ptr.hpp>
-#include <boost/make_shared.hpp>
 #include <boost/regex.hpp>
 
 // Configuration
@@ -61,6 +58,12 @@ static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 // Source-highlight data directory (set at compile time via configure)
 // configure.ac auto-detects from pkg-config or uses --with-source-highlight-data-dir
 static const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
+
+// Language map for extension -> .lang file lookup (loaded once at startup)
+static srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
+
+// Language inferrer for content-based detection (shebang, emacs mode, etc.)
+static srchilite::LanguageInfer languageInfer;
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -135,7 +138,7 @@ private:
 };
 
 // Forward declarations
-static std::string detectLanguage(const std::string& filename, const std::string& content);
+static std::string detectLanguage(const std::string& content);
 
 // Extensions to skip entirely (don't even call source-highlight)
 // These are documentation, binary, or compressed files that never need patching
@@ -158,37 +161,6 @@ static const std::unordered_set<std::string> SKIP_EXTENSIONS = {
 // Scripts needing patching are typically small; large extensionless files are data/binary
 static constexpr size_t MAX_CONTENT_DETECT_SIZE = 64 * 1024;  // 64KB
 
-// Map file extensions to source-highlight .lang files
-// This is the fast path - no source-highlight parsing needed
-static const std::unordered_map<std::string, std::string> EXTENSION_TO_LANG = {
-    // Shell
-    {".sh", "sh.lang"}, {".bash", "sh.lang"}, {".zsh", "zsh.lang"},
-    // Python
-    {".py", "python.lang"}, {".pyw", "python.lang"},
-    // Perl
-    {".pl", "perl.lang"}, {".pm", "perl.lang"},
-    // Ruby
-    {".rb", "ruby.lang"},
-    // Lua
-    {".lua", "lua.lang"},
-    // Tcl
-    {".tcl", "tcl.lang"},
-    // JavaScript/JSON
-    {".js", "javascript.lang"}, {".mjs", "javascript.lang"},
-    {".json", "json.lang"},
-    // Config files
-    {".conf", "conf.lang"}, {".cfg", "conf.lang"},
-    {".desktop", "desktop.lang"},
-    {".properties", "properties.lang"},
-    {".ini", "ini.lang"},
-    // Build systems
-    {".mk", "makefile.lang"},
-    {".m4", "m4.lang"},
-    // XML
-    {".xml", "xml.lang"},
-    // Awk
-    {".awk", "awk.lang"},
-};
 
 // Whitelist of language files worth tokenizing for string literal patching
 // These are script/config files that may contain /nix/store paths
@@ -231,14 +203,6 @@ static inline std::string getExtension(const std::string& filename)
     return ext;
 }
 
-// Get .lang file from extension (fast path - O(1) hash lookup)
-static inline std::string getLangFromExtension(const std::string& filename)
-{
-    std::string ext = getExtension(filename);
-    auto it = EXTENSION_TO_LANG.find(ext);
-    return (it != EXTENSION_TO_LANG.end()) ? it->second : "";
-}
-
 // Check if file should be skipped based on extension (non-patchable files)
 static inline bool shouldSkipByExtension(const std::string& filename)
 {
@@ -246,40 +210,22 @@ static inline bool shouldSkipByExtension(const std::string& filename)
     return !ext.empty() && SKIP_EXTENSIONS.count(ext) > 0;
 }
 
-// Detect language from filename and/or content
+// Detect language from content (shebang, emacs mode, xml, etc.)
 // Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
-static std::string detectLanguage(const std::string& filename, const std::string& content)
+static std::string detectLanguage(const std::string& content)
 {
-    if (sourceHighlightDataDir.empty()) return "";
+    // Content-based detection (shebang, emacs mode, xml, etc.)
+    std::istringstream contentStream(content);
+    std::string inferredLang = languageInfer.infer(contentStream);
 
-    try {
-        srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
-
-        // 1. Try filename-based detection first
-        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
+    if (!inferredLang.empty()) {
+        std::string langFile = langMap.getMappedFileName(inferredLang);
         if (!langFile.empty()) {
-            debug("  detected language from filename: %s -> %s\n",
-                  filename.c_str(), langFile.c_str());
+            debug("  detected language from content: %s -> %s\n",
+                  inferredLang.c_str(), langFile.c_str());
             return langFile;
         }
-
-        // 2. Try content-based detection (shebang, emacs mode, xml, etc.)
-        srchilite::LanguageInfer languageInfer;
-        std::istringstream contentStream(content);
-        std::string inferredLang = languageInfer.infer(contentStream);
-
-        if (!inferredLang.empty()) {
-            langFile = langMap.getMappedFileName(inferredLang);
-            if (!langFile.empty()) {
-                debug("  detected language from content: %s -> %s\n",
-                      inferredLang.c_str(), langFile.c_str());
-                return langFile;
-            }
-            debug("  inferred language '%s' but no mapping found\n", inferredLang.c_str());
-        }
-
-    } catch (const std::exception& e) {
-        debug("  language detection failed: %s\n", e.what());
+        debug("  inferred language '%s' but no mapping found\n", inferredLang.c_str());
     }
 
     return "";
@@ -305,18 +251,18 @@ static std::string patchSourceWithHighlighter(
         srchilite::BufferedOutput bufferedOutput(outputStream);
 
         // Identity formatter for non-string elements (outputs text as-is)
-        auto identityFormatter = boost::make_shared<srchilite::TextStyleFormatter>(
+        auto identityFormatter = std::make_unique<srchilite::TextStyleFormatter>(
             "$text", &bufferedOutput);
 
         // String formatter with path translation
         NixPathTranslator translator;
-        auto stringFormatter = boost::make_shared<srchilite::TextStyleFormatter>(
+        auto stringFormatter = std::make_unique<srchilite::TextStyleFormatter>(
             "$text", &bufferedOutput);
         stringFormatter->setPreFormatter(&translator);
 
         // Register formatters
-        srchilite::FormatterManager formatterManager(identityFormatter);
-        formatterManager.addFormatter("string", stringFormatter);
+        srchilite::FormatterManager formatterManager(std::move(identityFormatter));
+        formatterManager.addFormatter("string", std::move(stringFormatter));
         highlighter.setFormatterManager(&formatterManager);
 
         // Process entire content at once
@@ -550,13 +496,13 @@ static std::vector<std::byte> patchElfContent(
     const std::span<const std::byte> content,
     [[maybe_unused]] const bool executable)
 {
-    // Convert span to vector for patchelf (needs mutable shared_ptr)
-    auto fileContents = std::make_shared<std::vector<unsigned char>>(
+    // Convert span to vector for patchelf (unique_ptr converts to shared_ptr)
+    auto fileContents = std::make_unique<std::vector<unsigned char>>(
         reinterpret_cast<const unsigned char*>(content.data()),
         reinterpret_cast<const unsigned char*>(content.data()) + content.size());
 
     try {
-        ElfFileType elfFile(fileContents);
+        ElfFileType elfFile(std::move(fileContents));
 
         // Get current interpreter
         std::string interp;
@@ -725,8 +671,8 @@ static std::vector<std::byte> patchContent(
                 content, executable);
         }
     } else {
-        // Try extension-based language detection first (O(1) hash lookup)
-        std::string langFile = getLangFromExtension(filename);
+        // Try extension-based language detection first
+        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
 
         // If no extension mapping, check skip extensions and size threshold
         if (langFile.empty()) {
@@ -742,7 +688,7 @@ static std::vector<std::byte> patchContent(
             if (!sourceHighlightDataDir.empty() && hasShebang(content)) {
                 if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
                     std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-                    langFile = detectLanguage(filename, contentStr);
+                    langFile = detectLanguage(contentStr);
                 } else {
                     debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
                 }
