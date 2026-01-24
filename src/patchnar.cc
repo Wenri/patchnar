@@ -49,8 +49,9 @@ static std::string glibcPath;
 static std::string oldGlibcPath;
 static bool debugMode = false;
 
-// Additional paths to prefix in script strings (e.g., "/nix/var/")
-static std::vector<std::string> addPrefixToPaths;
+// Additional paths to prefix in script strings
+// Default includes /nix/var/ which is commonly needed for nix daemon scripts
+static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
 // String region representing a string literal in source code
 struct StringRegion {
@@ -799,8 +800,8 @@ static void showHelp(const char* progName)
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
-              << "  --add-prefix-to PATH Path pattern to add prefix to in script strings\n"
-              << "                       (e.g., /nix/var/). Can be specified multiple times.\n"
+              << "  --add-prefix-to PATH Path pattern to add prefix to in script strings.\n"
+              << "                       Can be specified multiple times. Default: /nix/var/\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
