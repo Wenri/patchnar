@@ -1,12 +1,10 @@
 /*
- * NAR (Nix ARchive) format streaming implementation with TBB parallel_pipeline
+ * NAR (Nix ARchive) format streaming implementation
  *
- * Parallel pipeline architecture:
- * - TBB parallel_pipeline: parse (serial) → patch (parallel) → write (serial)
- * - Generator yields NarNode items as parsed (no tree allocation)
- * - Parallel patching with automatic backpressure (8 tokens in flight)
- * - Order preserved via serial_in_order filter modes
- * - Memory: O(8 × max_file) - bounded by token count
+ * Processing architecture:
+ * - C++23 generator yields NarNode items as parsed (no tree allocation)
+ * - Serial processing: parse → patch → write
+ * - Memory: O(max_file) - one file content in memory at a time
  */
 
 #include "nar.h"
@@ -27,7 +25,7 @@ static constexpr const char* NAR_MAGIC = "nix-archive-1";
 // ============================================================================
 
 NarProcessor::NarProcessor(std::istream& in, std::ostream& out)
-    : in_(in), out_(out), parseGen_(parse()), it_(parseGen_.begin())
+    : in_(in), out_(out)
 {
 }
 
@@ -298,8 +296,9 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    // Simple serial processing - bypass TBB for debugging
-    for (auto it = parseGen_.begin(); it != parseGen_.end(); ++it) {
+    // Create generator and iterate (generator is single-pass, must only call begin() once)
+    auto gen = parse();
+    for (auto it = gen.begin(); it != gen.end(); ++it) {
         NarNode node = std::move(*it);
 
         // Patch
