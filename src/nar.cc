@@ -241,6 +241,9 @@ std::generator<NarNode> NarProcessor::parseDirectory(std::string path)
 void NarProcessor::writeNode(const NarNode& node)
 {
     switch (node.type) {
+        case NarNode::Type::Invalid:
+            throw std::runtime_error("Attempted to write Invalid NarNode (uninitialized node)");
+
         case NarNode::Type::DirectoryStart:
             writeString("(");
             writeString("type");
@@ -295,44 +298,20 @@ void NarProcessor::process()
 {
     writeString(NAR_MAGIC);
 
-    oneapi::tbb::parallel_pipeline(
-        8,  // max_number_of_live_tokens - automatic backpressure
+    // Simple serial processing - bypass TBB for debugging
+    for (auto it = parseGen_.begin(); it != parseGen_.end(); ++it) {
+        NarNode node = std::move(*it);
 
-        // Stage 1: Parse (serial input - NAR is sequential)
-        oneapi::tbb::make_filter<void, NarNode>(
-            oneapi::tbb::filter_mode::serial_in_order,
-            [this](oneapi::tbb::flow_control& fc) -> NarNode {
-                if (it_ == parseGen_.end()) {
-                    fc.stop();
-                    return {};
-                }
-                NarNode node = std::move(*it_);
-                ++it_;
-                return node;
-            }
-        ) &
+        // Patch
+        if (node.type == NarNode::Type::RegularFile && contentPatcher_) {
+            node.content = contentPatcher_(node.content, node.executable, node.path);
+        } else if (node.type == NarNode::Type::Symlink && symlinkPatcher_) {
+            node.target = symlinkPatcher_(node.target);
+        }
 
-        // Stage 2: Patch (parallel - the expensive part)
-        oneapi::tbb::make_filter<NarNode, NarNode>(
-            oneapi::tbb::filter_mode::parallel,
-            [this](NarNode n) -> NarNode {
-                if (n.type == NarNode::Type::RegularFile && contentPatcher_) {
-                    n.content = contentPatcher_(n.content, n.executable, n.path);
-                } else if (n.type == NarNode::Type::Symlink && symlinkPatcher_) {
-                    n.target = symlinkPatcher_(n.target);
-                }
-                return n;
-            }
-        ) &
-
-        // Stage 3: Write (serial output - preserves order)
-        oneapi::tbb::make_filter<NarNode, void>(
-            oneapi::tbb::filter_mode::serial_in_order,
-            [this](NarNode n) {
-                writeNode(n);
-            }
-        )
-    );
+        // Write
+        writeNode(node);
+    }
 
     out_.flush();
 }

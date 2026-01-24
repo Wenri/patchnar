@@ -46,12 +46,13 @@ using SymlinkPatcher = std::function<std::string(const std::string&)>;
 
 struct NarNode {
     enum class Type {
+        Invalid = -1,  // Default value for uninitialized nodes
         DirectoryStart, DirectoryEnd,
         EntryStart, EntryEnd,
         RegularFile, Symlink
     };
 
-    Type type;
+    Type type = Type::Invalid;  // Initialize to Invalid to catch bugs
     std::string name;                    // Entry name (for EntryStart)
     std::string path;                    // Full path
     std::vector<std::byte> content;      // File content (for RegularFile)
