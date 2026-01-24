@@ -299,7 +299,7 @@ static std::vector<StringRegion> getStringRegions(const std::string& content, co
 }
 
 // Check if a position is inside any string region
-static bool isInsideString(size_t pos, const std::vector<StringRegion>& regions)
+static bool isInsideString(const size_t pos, const std::vector<StringRegion>& regions)
 {
     for (const auto& region : regions) {
         if (pos >= region.start && pos < region.end) {
@@ -379,7 +379,7 @@ static void applyHashMappings(std::vector<std::byte>& content)
 }
 
 // Check if content is an ELF file
-static bool isElf(std::span<const std::byte> content)
+static bool isElf(const std::span<const std::byte> content)
 {
     if (content.size() < SELFMAG)
         return false;
@@ -388,7 +388,7 @@ static bool isElf(std::span<const std::byte> content)
 
 // Check if content has a shebang (starts with #!)
 // Used only to determine if shebang patching should be applied
-static bool hasShebang(std::span<const std::byte> content)
+static bool hasShebang(const std::span<const std::byte> content)
 {
     if (content.size() < 2)
         return false;
@@ -396,7 +396,7 @@ static bool hasShebang(std::span<const std::byte> content)
 }
 
 // Check if ELF is 32-bit
-static bool isElf32(std::span<const std::byte> content)
+static bool isElf32(const std::span<const std::byte> content)
 {
     if (content.size() < EI_CLASS + 1)
         return false;
@@ -531,8 +531,8 @@ class ElfFile;
 // Patch ELF binary content
 template<class ElfFileType>
 static std::vector<std::byte> patchElfContent(
-    std::span<const std::byte> content,
-    [[maybe_unused]] bool executable)
+    const std::span<const std::byte> content,
+    [[maybe_unused]] const bool executable)
 {
     // Convert span to vector for patchelf (needs mutable shared_ptr)
     auto fileContents = std::make_shared<std::vector<unsigned char>>(
@@ -607,7 +607,7 @@ static std::vector<std::byte> patchElfContent(
 
 // Patch source file: shebang (if present) and string literals
 // The langFile is the detected .lang file (e.g., "sh.lang", "python.lang")
-static std::vector<std::byte> patchSource(std::span<const std::byte> content, const std::string& langFile)
+static std::vector<std::byte> patchSource(const std::span<const std::byte> content, const std::string& langFile)
 {
     if (prefix.empty()) {
         return std::vector<std::byte>(content.begin(), content.end());
@@ -720,8 +720,8 @@ static std::vector<std::byte> patchSource(std::span<const std::byte> content, co
 // Main content patcher
 // The path parameter is the relative path within the NAR (e.g., "bin/bash", "share/nix/nix.sh")
 static std::vector<std::byte> patchContent(
-    std::span<const std::byte> content,
-    bool executable,
+    const std::span<const std::byte> content,
+    const bool executable,
     const std::string& path)
 {
     std::vector<std::byte> result;
