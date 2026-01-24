@@ -166,7 +166,7 @@ static void debug(const char* format, ...)
 }
 
 // Get lowercase file extension (e.g., ".html", ".png")
-static std::string getExtension(const std::string& filename)
+static inline std::string getExtension(const std::string& filename)
 {
     size_t dot = filename.rfind('.');
     if (dot == std::string::npos || dot == 0) {
@@ -179,7 +179,7 @@ static std::string getExtension(const std::string& filename)
 }
 
 // Get .lang file from extension (fast path - O(1) hash lookup)
-static std::string getLangFromExtension(const std::string& filename)
+static inline std::string getLangFromExtension(const std::string& filename)
 {
     std::string ext = getExtension(filename);
     auto it = EXTENSION_TO_LANG.find(ext);
@@ -187,7 +187,7 @@ static std::string getLangFromExtension(const std::string& filename)
 }
 
 // Check if file should be skipped based on extension (non-patchable files)
-static bool shouldSkipByExtension(const std::string& filename)
+static inline bool shouldSkipByExtension(const std::string& filename)
 {
     std::string ext = getExtension(filename);
     return !ext.empty() && SKIP_EXTENSIONS.count(ext) > 0;
@@ -299,7 +299,7 @@ static std::vector<StringRegion> getStringRegions(const std::string& content, co
 }
 
 // Check if a position is inside any string region
-static bool isInsideString(const size_t pos, const std::vector<StringRegion>& regions)
+static inline bool isInsideString(const size_t pos, const std::vector<StringRegion>& regions)
 {
     for (const auto& region : regions) {
         if (pos >= region.start && pos < region.end) {
@@ -379,7 +379,7 @@ static void applyHashMappings(std::vector<std::byte>& content)
 }
 
 // Check if content is an ELF file
-static bool isElf(const std::span<const std::byte> content)
+static inline bool isElf(const std::span<const std::byte> content)
 {
     if (content.size() < SELFMAG)
         return false;
@@ -388,7 +388,7 @@ static bool isElf(const std::span<const std::byte> content)
 
 // Check if content has a shebang (starts with #!)
 // Used only to determine if shebang patching should be applied
-static bool hasShebang(const std::span<const std::byte> content)
+static inline bool hasShebang(const std::span<const std::byte> content)
 {
     if (content.size() < 2)
         return false;
@@ -396,7 +396,7 @@ static bool hasShebang(const std::span<const std::byte> content)
 }
 
 // Check if ELF is 32-bit
-static bool isElf32(const std::span<const std::byte> content)
+static inline bool isElf32(const std::span<const std::byte> content)
 {
     if (content.size() < EI_CLASS + 1)
         return false;

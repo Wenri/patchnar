@@ -89,7 +89,7 @@ static int forcedPageSize = -1;
     return parts;
 }
 
-static bool hasAllowedPrefix(const std::string & s, const std::vector<std::string> & allowedPrefixes)
+static inline bool hasAllowedPrefix(const std::string & s, const std::vector<std::string> & allowedPrefixes)
 {
     return std::any_of(allowedPrefixes.begin(), allowedPrefixes.end(), [&](const std::string & i) { return !s.compare(0, i.size(), i); });
 }
@@ -139,7 +139,7 @@ static void debug(const char * format, ...)
 }
 
 
-static void fmt2([[maybe_unused]] std::ostringstream & out)
+static inline void fmt2([[maybe_unused]] std::ostringstream & out)
 {
 }
 
@@ -239,14 +239,14 @@ struct ElfType
 }
 
 
-static void checkPointer(const FileContents & contents, const void * p, size_t size)
+static inline void checkPointer(const FileContents & contents, const void * p, size_t size)
 {
     if (p < contents->data() || size > contents->size() || p > contents->data() + contents->size() - size)
         error("data region extends past file end");
 }
 
 
-static void checkOffset(const FileContents & contents, size_t offset, size_t size)
+static inline void checkOffset(const FileContents & contents, size_t offset, size_t size)
 {
     size_t end;
 
@@ -258,7 +258,7 @@ static void checkOffset(const FileContents & contents, size_t offset, size_t siz
 }
 
 
-static std::string extractString(const FileContents & contents, size_t offset, size_t size)
+static inline std::string extractString(const FileContents & contents, size_t offset, size_t size)
 {
     checkOffset(contents, offset, size);
     return { reinterpret_cast<const char *>(contents->data()) + offset, size };
@@ -479,7 +479,7 @@ static void writeFile(const std::string & fileName, const FileContents & content
 }
 
 
-static uint64_t roundUp(uint64_t n, uint64_t m)
+static inline uint64_t roundUp(uint64_t n, uint64_t m)
 {
     if (n == 0)
         return m;
@@ -1349,7 +1349,7 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
 
 
 
-static void setSubstr(std::string & s, unsigned int pos, const std::string & t)
+static inline void setSubstr(std::string & s, unsigned int pos, const std::string & t)
 {
     assert(pos + t.size() <= s.size());
     copy(t.begin(), t.end(), s.begin() + pos);
@@ -1518,7 +1518,7 @@ void ElfFile<ElfFileParamNames>::setInterpreter(const std::string & newInterpret
 }
 
 
-static void appendRPath(std::string & rpath, const std::string & path)
+static inline void appendRPath(std::string & rpath, const std::string & path)
 {
     if (!rpath.empty()) rpath += ":";
     rpath += path;
@@ -2088,7 +2088,7 @@ void ElfFile<ElfFileParamNames>::addDebugTag()
     changed = true;
 }
 
-static uint32_t gnuHash(std::string_view name) {
+static inline uint32_t gnuHash(std::string_view name) {
     uint32_t h = 5381;
     for (uint8_t c : name)
         h = ((h << 5) + h) + c;
@@ -2215,7 +2215,7 @@ void ElfFile<ElfFileParamNames>::rebuildGnuHashTable(span<char> strTab, span<Elf
     }
 }
 
-static uint32_t sysvHash(std::string_view name) {
+static inline uint32_t sysvHash(std::string_view name) {
     uint32_t h = 0;
     for (uint8_t c : name)
     {
