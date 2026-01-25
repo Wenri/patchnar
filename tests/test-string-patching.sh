@@ -53,9 +53,9 @@ assert_contains "$result" "echo 'File at /data/data/com.termux.nix/files/usr/nix
     "single-quoted echo patched"
 
 
-# Test 3: Ruby string literals
+# Test 3: Ruby string literals (requires --add-lang)
 echo ""
-echo "Testing ruby string patching..."
+echo "Testing ruby string patching with --add-lang..."
 
 cat > pkg/bin/string_ruby << 'EOF'
 #!/nix/store/abc123-ruby-3.2/bin/ruby
@@ -66,7 +66,7 @@ EOF
 chmod +x pkg/bin/string_ruby
 
 create_test_nar pkg input.nar
-run_patchnar < input.nar > output.nar
+run_patchnar --add-lang ruby.lang < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /bin/string_ruby)
 assert_contains "$result" 'config = "/data/data/com.termux.nix/files/usr/nix/store/cfg222-config/etc/ruby.conf"' \
@@ -75,9 +75,9 @@ assert_contains "$result" "data = '/data/data/com.termux.nix/files/usr/nix/store
     "ruby single-quoted string patched"
 
 
-# Test 4: Python string literals
+# Test 4: Python string literals (requires --add-lang)
 echo ""
-echo "Testing python string patching..."
+echo "Testing python string patching with --add-lang..."
 
 cat > pkg/bin/string_python << 'EOF'
 #!/nix/store/abc123-python-3.11/bin/python3
@@ -88,7 +88,7 @@ EOF
 chmod +x pkg/bin/string_python
 
 create_test_nar pkg input.nar
-run_patchnar < input.nar > output.nar
+run_patchnar --add-lang python.lang < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /bin/string_python)
 assert_contains "$result" 'config_path = "/data/data/com.termux.nix/files/usr/nix/store/cfg444-config/etc/python.conf"' \

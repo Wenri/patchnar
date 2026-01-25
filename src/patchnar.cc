@@ -158,20 +158,10 @@ static constexpr size_t MAX_CONTENT_DETECT_SIZE = 64 * 1024;  // 64KB
 
 // Whitelist of language files worth tokenizing for string literal patching
 // These are script/config files that may contain /nix/store paths
-static const std::unordered_set<std::string> PATCHABLE_LANG_FILES = {
-    // Shell scripts (most common)
+// Default: shell scripts only; extensible via --add-lang option
+static std::unordered_set<std::string> patchableLangFiles = {
     "sh.lang",
     "zsh.lang",
-    // Other scripting languages
-    "python.lang",
-    "ruby.lang",
-    "tcl.lang",
-    "lua.lang",
-    "awk.lang",
-    // Build systems and config files
-    "makefile.lang",
-    "conf.lang",
-    "json.lang",
 };
 
 static void debug(const char* format, ...)
@@ -668,7 +658,7 @@ static std::vector<std::byte> patchContent(
 
     // === SOURCE PATCHING (strings + comments including shebangs) ===
     std::vector<std::byte> result;
-    if (!langFile.empty() && PATCHABLE_LANG_FILES.count(langFile)) {
+    if (!langFile.empty() && patchableLangFiles.count(langFile)) {
         debug("  patching source %s (%zu bytes, lang=%s)\n",
               path.c_str(), content.size(), langFile.c_str());
         result = patchSource(content, langFile);
@@ -700,6 +690,7 @@ static void showHelp(const char* progName)
               << "  old-glibc:           " << oldGlibcPath << "\n"
               << "  source-highlight:    " << sourceHighlightDataDir << "\n"
               << "  add-prefix-to:       /nix/var/ (default)\n"
+              << "  patchable-langs:     sh.lang, zsh.lang (default)\n"
               << "\n"
               << "Options:\n"
               << "  --glibc PATH         Android glibc store path (to replace old-glibc)\n"
@@ -707,6 +698,7 @@ static void showHelp(const char* progName)
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
               << "  --add-prefix-to PATH Additional path pattern to prefix in script strings\n"
+              << "  --add-lang LANG      Additional language to patch (e.g., python.lang, json.lang)\n"
               << "  --debug              Enable debug output\n"
               << "  --help               Show this help\n";
 }
@@ -718,13 +710,14 @@ int main(int argc, char** argv)
         {"mappings",                 required_argument, nullptr, 'm'},
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
+        {"add-lang",                 required_argument, nullptr, 'L'},
         {"debug",                    no_argument,       nullptr, 'd'},
         {"help",                     no_argument,       nullptr, 'h'},
         {nullptr,                    0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "g:m:s:A:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "g:m:s:A:L:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'g':
             glibcPath = optarg;
@@ -750,6 +743,9 @@ int main(int argc, char** argv)
         case 'A':
             addPrefixToPaths.push_back(optarg);
             break;
+        case 'L':
+            patchableLangFiles.insert(optarg);
+            break;
         case 'd':
             debugMode = true;
             break;
@@ -768,6 +764,9 @@ int main(int argc, char** argv)
     debug("patchnar: source-highlight-data-dir=%s\n", sourceHighlightDataDir.c_str());
     for (const auto& path : addPrefixToPaths) {
         debug("patchnar: add-prefix-to=%s\n", path.c_str());
+    }
+    for (const auto& lang : patchableLangFiles) {
+        debug("patchnar: patchable-lang=%s\n", lang.c_str());
     }
 
     try {

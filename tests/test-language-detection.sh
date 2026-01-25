@@ -29,9 +29,9 @@ assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-
     ".sh extension: string patched"
 
 
-# Test 2: Extension-based detection (.json)
+# Test 2: Extension-based detection (.json) with --add-lang
 echo ""
-echo "Testing .json extension detection..."
+echo "Testing .json extension detection with --add-lang..."
 
 cat > pkg/share/config.json << 'EOF'
 {
@@ -41,16 +41,16 @@ cat > pkg/share/config.json << 'EOF'
 EOF
 
 create_test_nar pkg input.nar
-run_patchnar < input.nar > output.nar
+run_patchnar --add-lang json.lang < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /share/config.json)
 assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-data/share/data" \
-    ".json extension: string patched"
+    ".json extension with --add-lang: string patched"
 
 
-# Test 3: Extension-based detection (.py)
+# Test 3: Extension-based detection (.py) with --add-lang
 echo ""
-echo "Testing .py extension detection..."
+echo "Testing .py extension detection with --add-lang..."
 
 cat > pkg/share/script.py << 'EOF'
 #!/usr/bin/python3
@@ -59,11 +59,11 @@ print(path)
 EOF
 
 create_test_nar pkg input.nar
-run_patchnar < input.nar > output.nar
+run_patchnar --add-lang python.lang < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /share/script.py)
 assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-data/share/data" \
-    ".py extension: string patched"
+    ".py extension with --add-lang: string patched"
 
 
 # Test 4: Shebang-based detection (no extension, bash)
