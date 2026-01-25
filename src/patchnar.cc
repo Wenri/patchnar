@@ -44,12 +44,15 @@
 #include <srchilite/chartranslator.h>
 #include <boost/regex.hpp>
 
-// Configuration
-// Installation prefix set at compile time via configure --with-install-prefix
+// Configuration (compile-time constants from configure)
 static const std::string prefix = INSTALL_PREFIX;
+static const std::string oldGlibcPath = OLD_GLIBC_PATH;
+// Pre-escaped for regex (uses $& for match reference in Boost format)
+static const std::string escapedOldGlibc = boost::regex_replace(
+    oldGlibcPath, boost::regex(R"([.^$|()[\]{}*+?\\])"), R"(\\$&)");
+
+// Runtime configuration
 static std::string glibcPath;
-// Standard glibc path to substitute (compile-time default, can be overridden with --old-glibc)
-static std::string oldGlibcPath = OLD_GLIBC_PATH;
 static bool debugMode = false;
 
 // Additional paths to prefix in script strings
@@ -77,11 +80,8 @@ class NixPathTranslator : public srchilite::CharTranslator {
 public:
     NixPathTranslator() : srchilite::CharTranslator() {
         // Use CharTranslator's regex for glibc path replacement
-        // This is safe because oldGlibcPath is a unique exact match
         if (!oldGlibcPath.empty() && !glibcPath.empty()) {
-            // Escape regex special characters in the path
-            std::string escapedOld = escapeRegex(oldGlibcPath);
-            set_translation(escapedOld, glibcPath);
+            set_translation(escapedOldGlibc, glibcPath);
         }
     }
 
@@ -128,14 +128,6 @@ protected:
         }
 
         return result;
-    }
-
-private:
-    // Escape regex special characters
-    // Uses $& (Boost/Perl format) to reference the matched character
-    static std::string escapeRegex(const std::string& s) {
-        static const boost::regex specialChars(R"([.^$|()[\]{}*+?\\])");
-        return boost::regex_replace(s, specialChars, R"(\\$&)");
     }
 };
 
@@ -712,13 +704,12 @@ static void showHelp(const char* progName)
               << "\n"
               << "Compile-time settings:\n"
               << "  prefix:              " << prefix << "\n"
-              << "  old-glibc:           " << (OLD_GLIBC_PATH[0] ? OLD_GLIBC_PATH : "(not set)") << "\n"
+              << "  old-glibc:           " << oldGlibcPath << "\n"
               << "  source-highlight:    " << sourceHighlightDataDir << "\n"
               << "  add-prefix-to:       /nix/var/ (default)\n"
               << "\n"
               << "Options:\n"
-              << "  --glibc PATH         Android glibc store path\n"
-              << "  --old-glibc PATH     Original glibc store path to replace (overrides compile-time default)\n"
+              << "  --glibc PATH         Android glibc store path (to replace old-glibc)\n"
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
@@ -731,7 +722,6 @@ int main(int argc, char** argv)
 {
     static struct option longOptions[] = {
         {"glibc",                    required_argument, nullptr, 'g'},
-        {"old-glibc",                required_argument, nullptr, 'G'},
         {"mappings",                 required_argument, nullptr, 'm'},
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
@@ -741,13 +731,10 @@ int main(int argc, char** argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "g:G:m:s:A:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "g:m:s:A:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'g':
             glibcPath = optarg;
-            break;
-        case 'G':
-            oldGlibcPath = optarg;
             break;
         case 'm':
             loadMappings(optarg);

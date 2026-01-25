@@ -1,5 +1,6 @@
 #!/bin/sh
 # Test symlink target patching
+# The old glibc path is baked in at compile time from stdenv.cc.libc
 
 . "$(dirname "$0")/test-helper.sh"
 
@@ -9,6 +10,17 @@ check_patchnar_available
 WORKDIR=$(create_workdir)
 setup_workdir_cleanup "$WORKDIR"
 cd "$WORKDIR"
+
+# Get the compile-time old glibc path from patchnar --help
+OLD_GLIBC=$("$PATCHNAR" --help 2>&1 | grep "old-glibc:" | sed 's/.*old-glibc: *//')
+if [ -z "$OLD_GLIBC" ]; then
+    echo "ERROR: Could not determine compile-time old-glibc path"
+    exit 1
+fi
+echo "Using compile-time old-glibc: $OLD_GLIBC"
+
+# Extract just the basename for assertions (e.g., "glibc-2.40-66")
+OLD_GLIBC_BASE=$(basename "$OLD_GLIBC")
 
 mkdir -p pkg/bin pkg/lib
 
@@ -37,18 +49,17 @@ echo "Testing symlink with glibc substitution..."
 rm -rf pkg
 mkdir -p pkg/lib
 
-# Create a symlink like what glibc has
-ln -s /nix/store/old111-glibc-2.40/lib/libc.so.6 pkg/lib/libc_link
+# Create a symlink like what glibc has (using compile-time old glibc)
+ln -s "${OLD_GLIBC}/lib/libc.so.6" pkg/lib/libc_link
 
 create_test_nar pkg input.nar
 run_patchnar --glibc /nix/store/new222-glibc-android-2.40 \
-             --old-glibc /nix/store/old111-glibc-2.40 \
              < input.nar > output.nar
 
 result=$(strings output.nar | grep -o "/[^ ]*glibc[^ ]*" | head -1)
 assert_contains "$result" "new222-glibc-android-2.40" \
     "glibc in symlink substituted"
-assert_not_contains "$result" "old111-glibc-2.40" \
+assert_not_contains "$result" "$OLD_GLIBC_BASE" \
     "old glibc not in symlink"
 
 
@@ -97,19 +108,18 @@ echo ""
 echo "Testing relative symlink with glibc basename..."
 
 rm -rf pkg
-mkdir -p pkg/lib/old111-glibc-2.40/lib
+mkdir -p "pkg/lib/${OLD_GLIBC_BASE}/lib"
 
-echo "ld content" > pkg/lib/old111-glibc-2.40/lib/ld.so
-ln -s ../old111-glibc-2.40/lib/ld.so pkg/lib/ld_link
+echo "ld content" > "pkg/lib/${OLD_GLIBC_BASE}/lib/ld.so"
+ln -s "../${OLD_GLIBC_BASE}/lib/ld.so" pkg/lib/ld_link
 
 create_test_nar pkg input.nar
 run_patchnar --glibc /nix/store/new222-glibc-android-2.40 \
-             --old-glibc /nix/store/old111-glibc-2.40 \
              < input.nar > output.nar
 
 result=$(strings output.nar | grep "glibc" | grep -v "nix/store" | head -1 || echo "not found")
 # Relative symlinks with glibc basename should have the basename replaced
-# ../old111-glibc-2.40/lib/ld.so -> ../new222-glibc-android-2.40/lib/ld.so
+# ../${OLD_GLIBC_BASE}/lib/ld.so -> ../new222-glibc-android-2.40/lib/ld.so
 if echo "$result" | grep -q "new222-glibc-android-2.40"; then
     log_pass "relative symlink glibc basename replaced"
 else

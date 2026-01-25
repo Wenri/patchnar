@@ -1,6 +1,7 @@
 #!/bin/sh
 # Test transformStorePath functionality via ELF interpreter patching
 # transformStorePath: glibc replacement -> hash mapping -> prefix
+# The old glibc path is baked in at compile time from stdenv.cc.libc
 
 . "$(dirname "$0")/test-helper.sh"
 
@@ -10,6 +11,17 @@ check_patchnar_available
 WORKDIR=$(create_workdir)
 setup_workdir_cleanup "$WORKDIR"
 cd "$WORKDIR"
+
+# Get the compile-time old glibc path from patchnar --help
+OLD_GLIBC=$("$PATCHNAR" --help 2>&1 | grep "old-glibc:" | sed 's/.*old-glibc: *//')
+if [ -z "$OLD_GLIBC" ]; then
+    echo "ERROR: Could not determine compile-time old-glibc path"
+    exit 1
+fi
+echo "Using compile-time old-glibc: $OLD_GLIBC"
+
+# Extract just the basename for assertions (e.g., "glibc-2.40-66")
+OLD_GLIBC_BASE=$(basename "$OLD_GLIBC")
 
 # Create a minimal test package with a script
 mkdir -p pkg/bin
@@ -35,21 +47,20 @@ assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-
 echo ""
 echo "Testing glibc substitution with prefix..."
 
-cat > pkg/bin/test2 << 'EOF'
-#!/nix/store/old111-glibc-2.40/lib/ld-linux-aarch64.so.1 /nix/store/abc123-bash-5.2/bin/bash
+cat > pkg/bin/test2 << EOF
+#!${OLD_GLIBC}/lib/ld-linux-aarch64.so.1 /nix/store/abc123-bash-5.2/bin/bash
 echo "test"
 EOF
 chmod +x pkg/bin/test2
 
 create_test_nar pkg input.nar
 run_patchnar --glibc /nix/store/new222-glibc-android-2.40 \
-             --old-glibc /nix/store/old111-glibc-2.40 \
              < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /bin/test2)
 assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/new222-glibc-android-2.40/lib/ld-linux-aarch64.so.1" \
     "old glibc replaced with new glibc and prefixed"
-assert_not_contains "$result" "old111-glibc" \
+assert_not_contains "$result" "$OLD_GLIBC_BASE" \
     "old glibc path not present"
 
 
@@ -80,8 +91,8 @@ assert_not_contains "$result" "oldhash-perl" \
 echo ""
 echo "Testing combined transformation order..."
 
-cat > pkg/bin/test4 << 'EOF'
-#!/nix/store/old111-glibc-2.40/lib/ld-linux.so /nix/store/oldhash-bash-5.2/bin/bash
+cat > pkg/bin/test4 << EOF
+#!${OLD_GLIBC}/lib/ld-linux.so /nix/store/oldhash-bash-5.2/bin/bash
 echo "test"
 EOF
 chmod +x pkg/bin/test4
@@ -90,7 +101,6 @@ echo "/nix/store/oldhash-bash-5.2 /nix/store/newhash-bash-5.2" > mappings.txt
 
 create_test_nar pkg input.nar
 run_patchnar --glibc /nix/store/new222-glibc-android-2.40 \
-             --old-glibc /nix/store/old111-glibc-2.40 \
              --mappings mappings.txt \
              < input.nar > output.nar
 
