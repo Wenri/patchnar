@@ -1,4 +1,4 @@
-SUBDIRS = src
+SUBDIRS = src tests
 
 EXTRA_DIST = COPYING README.md version
 

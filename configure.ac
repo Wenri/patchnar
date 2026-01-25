@@ -85,5 +85,5 @@ AC_ARG_WITH([ubsan],
 )
 AM_CONDITIONAL([WITH_UBSAN], [test x"$with_ubsan" = xyes])
 
-AC_CONFIG_FILES([Makefile src/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile tests/Makefile])
 AC_OUTPUT

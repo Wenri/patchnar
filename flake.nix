@@ -24,6 +24,7 @@
         ./configure.ac
         ./m4
         ./src
+        ./tests
         ./version
       ];
 

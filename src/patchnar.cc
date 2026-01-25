@@ -131,9 +131,10 @@ protected:
 
 private:
     // Escape regex special characters
+    // Uses $& (Boost/Perl format) to reference the matched character
     static std::string escapeRegex(const std::string& s) {
         static const boost::regex specialChars(R"([.^$|()[\]{}*+?\\])");
-        return boost::regex_replace(s, specialChars, R"(\\&)");
+        return boost::regex_replace(s, specialChars, R"(\\$&)");
     }
 };
 
@@ -228,10 +229,23 @@ static std::string detectLanguage(const std::string& content)
     std::string inferredLang = languageInfer.infer(contentStream);
 
     if (!inferredLang.empty()) {
-        std::string langFile = langMap.getMappedFileName(inferredLang);
+        // Normalize common interpreter variants not in lang.map
+        // e.g., python3 → python, perl5.42.0 → perl
+        static const std::unordered_map<std::string, std::string> langAliases = {
+            {"python3", "python"},
+            {"python2", "python"},
+        };
+        std::string lookupLang = inferredLang;
+        auto aliasIt = langAliases.find(inferredLang);
+        if (aliasIt != langAliases.end()) {
+            lookupLang = aliasIt->second;
+            debug("  normalized '%s' -> '%s'\n", inferredLang.c_str(), lookupLang.c_str());
+        }
+
+        std::string langFile = langMap.getMappedFileName(lookupLang);
         if (!langFile.empty()) {
             debug("  detected language from content: %s -> %s\n",
-                  inferredLang.c_str(), langFile.c_str());
+                  lookupLang.c_str(), langFile.c_str());
             return langFile;
         }
         debug("  inferred language '%s' but no mapping found\n", inferredLang.c_str());
