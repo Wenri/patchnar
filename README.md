@@ -15,16 +15,18 @@ Based on [patchelf](https://github.com/NixOS/patchelf) and uses it as a library 
 
 ## Architecture
 
+patchnar uses C++23 coroutines (`std::generator`) for memory-efficient streaming:
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    TBB parallel_pipeline                        │
+│                    Streaming Pipeline                           │
 │                                                                 │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
 │  │ Parse NAR    │ -> │ Patch        │ -> │ Write NAR    │      │
-│  │ (serial)     │    │ (parallel)   │    │ (serial)     │      │
+│  │ (generator)  │    │ (transform)  │    │ (serial)     │      │
 │  └──────────────┘    └──────────────┘    └──────────────┘      │
 │                                                                 │
-│  8 tokens in flight for automatic backpressure                  │
+│  Memory: O(max_file) - one file in memory at a time             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -34,41 +36,43 @@ Based on [patchelf](https://github.com/NixOS/patchelf) and uses it as a library 
 $ patchnar [OPTIONS] < input.nar > output.nar
 ```
 
-### Options
+### Compile-Time Configuration
+
+These are set at build time via `configure`:
+
+| Configure Option | Description |
+|------------------|-------------|
+| `--with-install-prefix=PATH` | Installation prefix (e.g., `/data/data/com.termux.nix/files/usr`) |
+| `--with-old-glibc=PATH` | Standard glibc path to replace (required) |
+| `--with-source-highlight-data-dir=DIR` | Path to `.lang` files (auto-detected) |
+
+### Runtime Options
 
 | Option | Description |
 |--------|-------------|
-| `--prefix PATH` | Installation prefix (e.g., `/data/data/com.termux.nix/files/usr`) |
-| `--glibc PATH` | Android glibc store path |
-| `--old-glibc PATH` | Original glibc store path to replace |
+| `--glibc PATH` | Android glibc store path (replacement for compile-time old-glibc) |
 | `--mappings FILE` | Hash mappings file (format: `OLD_PATH NEW_PATH` per line) |
 | `--self-mapping MAP` | Self-reference mapping (`OLD_PATH NEW_PATH`) |
 | `--add-prefix-to PATH` | Path pattern to prefix in scripts (e.g., `/nix/var/`). Repeatable. |
-| `--source-highlight-data-dir DIR` | Path to source-highlight `.lang` files |
 | `--debug` | Enable debug output |
+| `--help` | Show help with compile-time constants |
 
 ### Example
 
 ```console
 $ nix-store --dump /nix/store/abc123-hello | patchnar \
-    --prefix /data/data/com.termux.nix/files/usr \
     --glibc /nix/store/xyz789-glibc-android-2.40 \
-    --old-glibc /nix/store/def456-glibc-2.40 \
     --mappings hash-mappings.txt \
     > patched-hello.nar
+
+# Check compile-time constants
+$ patchnar --help 2>&1 | grep -E "(install-prefix|old-glibc):"
 ```
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `TBB_NUM_THREADS` | Control thread count for parallel patching |
 
 ## Building
 
 Requires:
 - C++23 compiler (GCC 14+ or Clang 18+)
-- Intel TBB (onetbb >= 2020.0)
 - GNU Source-highlight (>= 3.0)
 - Boost (headers, for source-highlight)
 
@@ -76,7 +80,9 @@ Requires:
 
 ```console
 ./bootstrap.sh
-./configure
+./configure \
+  --with-install-prefix=/data/data/com.termux.nix/files/usr \
+  --with-old-glibc=/nix/store/xxx-glibc-2.40
 make
 sudo make install
 ```
@@ -85,6 +91,9 @@ sudo make install
 
 ```console
 nix build
+# The Nix build automatically passes:
+#   --with-install-prefix=${installationDir}
+#   --with-old-glibc=${gcc14Stdenv.cc.libc}
 ```
 
 ## How It Works
