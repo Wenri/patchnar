@@ -211,10 +211,9 @@ static std::string detectLanguage(const std::string& content)
     // Normalize Nix store paths in shebang for inference
     // #!/nix/store/xxx-perl-5.42.0/bin/perl → #!/bin/perl
     // This fixes LanguageInfer extracting hash instead of interpreter name
-    std::string normalized = content;
     static const boost::regex nixShebangRegex(
         R"(^(#!\s*)/nix/store/[a-z0-9]+-[^/]+(/bin/\S+))");
-    normalized = boost::regex_replace(normalized, nixShebangRegex, "$1$2",
+    std::string normalized = boost::regex_replace(content, nixShebangRegex, "$1$2",
         boost::regex_constants::format_first_only);
 
     // Content-based detection (shebang, emacs mode, xml, etc.)
