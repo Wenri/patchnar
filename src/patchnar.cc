@@ -464,12 +464,6 @@ static std::string patchSymlink(std::string target)
     return transformStorePath(std::move(target));
 }
 
-// Transform a single RPATH entry
-static std::string transformRpathEntry(std::string entry)
-{
-    return transformStorePath(std::move(entry));
-}
-
 // Build new RPATH from old RPATH by transforming each entry
 static std::string buildNewRpath(const std::string& oldRpath)
 {
@@ -488,7 +482,7 @@ static std::string buildNewRpath(const std::string& oldRpath)
                 if (!newRpath.empty()) {
                     newRpath += ':';
                 }
-                newRpath += transformRpathEntry(std::move(current));
+                newRpath += transformStorePath(std::move(current));
                 current.clear();
             }
         } else {
