@@ -163,7 +163,6 @@ static const std::unordered_set<std::string> PATCHABLE_LANG_FILES = {
     "sh.lang",
     "zsh.lang",
     // Other scripting languages
-    "perl.lang",
     "python.lang",
     "ruby.lang",
     "tcl.lang",
@@ -172,6 +171,7 @@ static const std::unordered_set<std::string> PATCHABLE_LANG_FILES = {
     // Build systems and config files
     "makefile.lang",
     "conf.lang",
+    "json.lang",
 };
 
 static void debug(const char* format, ...)
