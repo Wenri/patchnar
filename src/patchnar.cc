@@ -48,7 +48,8 @@
 // Installation prefix set at compile time via configure --with-install-prefix
 static const std::string prefix = INSTALL_PREFIX;
 static std::string glibcPath;
-static std::string oldGlibcPath;
+// Standard glibc path to substitute (compile-time default, can be overridden with --old-glibc)
+static std::string oldGlibcPath = OLD_GLIBC_PATH;
 static bool debugMode = false;
 
 // Additional paths to prefix in script strings
@@ -711,12 +712,13 @@ static void showHelp(const char* progName)
               << "\n"
               << "Compile-time settings:\n"
               << "  prefix:              " << prefix << "\n"
+              << "  old-glibc:           " << (OLD_GLIBC_PATH[0] ? OLD_GLIBC_PATH : "(not set)") << "\n"
               << "  source-highlight:    " << sourceHighlightDataDir << "\n"
               << "  add-prefix-to:       /nix/var/ (default)\n"
               << "\n"
               << "Options:\n"
               << "  --glibc PATH         Android glibc store path\n"
-              << "  --old-glibc PATH     Original glibc store path to replace\n"
+              << "  --old-glibc PATH     Original glibc store path to replace (overrides compile-time default)\n"
               << "  --mappings FILE      Hash mappings file for inter-package refs\n"
               << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"

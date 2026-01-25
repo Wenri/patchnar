@@ -62,6 +62,25 @@ AC_MSG_RESULT([Using installation prefix: $INSTALL_PREFIX])
 AC_DEFINE_UNQUOTED([INSTALL_PREFIX], ["${INSTALL_PREFIX}"],
     [Installation prefix for Android patching])
 
+# Standard glibc path for substitution (compile-time default)
+# This is the glibc that packages in nixpkgs are built against.
+# patchnar itself depends on this glibc, so if it changes, patchnar rebuilds.
+AC_ARG_WITH([old-glibc],
+   AS_HELP_STRING([--with-old-glibc=PATH], [Standard glibc store path to substitute (e.g., /nix/store/xxx-glibc-2.40)]),
+   [OLD_GLIBC_PATH="$withval"],
+   [OLD_GLIBC_PATH=""]
+)
+
+if test -n "$OLD_GLIBC_PATH"; then
+    AC_MSG_RESULT([Using old glibc path: $OLD_GLIBC_PATH])
+    AC_DEFINE_UNQUOTED([OLD_GLIBC_PATH], ["${OLD_GLIBC_PATH}"],
+        [Standard glibc store path to substitute])
+else
+    AC_MSG_RESULT([No old glibc path specified (use --old-glibc at runtime)])
+    AC_DEFINE([OLD_GLIBC_PATH], [""],
+        [Standard glibc store path to substitute])
+fi
+
 DEFAULT_PAGESIZE=auto
 AC_ARG_WITH([page-size],
    AS_HELP_STRING([--with-page-size=SIZE], [Specify default pagesize (default auto)]),
