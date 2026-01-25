@@ -214,8 +214,17 @@ static inline bool shouldSkipByExtension(const std::string& filename)
 // Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
 static std::string detectLanguage(const std::string& content)
 {
+    // Normalize Nix store paths in shebang for inference
+    // #!/nix/store/xxx-perl-5.42.0/bin/perl → #!/bin/perl
+    // This fixes LanguageInfer extracting hash instead of interpreter name
+    std::string normalized = content;
+    static const boost::regex nixShebangRegex(
+        R"(^(#!\s*)/nix/store/[a-z0-9]+-[^/]+(/bin/\S+))");
+    normalized = boost::regex_replace(normalized, nixShebangRegex, "$1$2",
+        boost::regex_constants::format_first_only);
+
     // Content-based detection (shebang, emacs mode, xml, etc.)
-    std::istringstream contentStream(content);
+    std::istringstream contentStream(normalized);
     std::string inferredLang = languageInfer.infer(contentStream);
 
     if (!inferredLang.empty()) {
@@ -232,7 +241,7 @@ static std::string detectLanguage(const std::string& content)
 }
 
 // One-pass source patching using PreFormatter
-// Tokenizes content and applies path translation only to string literals
+// Tokenizes content and applies path translation to strings AND comments (including shebangs)
 static std::string patchSourceWithHighlighter(
     const std::string& content,
     const std::string& langFile)
@@ -250,19 +259,28 @@ static std::string patchSourceWithHighlighter(
         std::ostringstream outputStream;
         srchilite::BufferedOutput bufferedOutput(outputStream);
 
-        // Identity formatter for non-string elements (outputs text as-is)
+        // Identity formatter for non-patchable elements (outputs text as-is)
         auto identityFormatter = std::make_unique<srchilite::TextStyleFormatter>(
             "$text", &bufferedOutput);
 
-        // String formatter with path translation
+        // Path translator shared by string and comment formatters
         NixPathTranslator translator;
+
+        // String formatter with path translation
         auto stringFormatter = std::make_unique<srchilite::TextStyleFormatter>(
             "$text", &bufferedOutput);
         stringFormatter->setPreFormatter(&translator);
 
+        // Comment formatter with path translation (handles shebangs!)
+        // Shebangs like #!/nix/store/xxx/bin/bash are recognized as comments
+        auto commentFormatter = std::make_unique<srchilite::TextStyleFormatter>(
+            "$text", &bufferedOutput);
+        commentFormatter->setPreFormatter(&translator);
+
         // Register formatters
         srchilite::FormatterManager formatterManager(std::move(identityFormatter));
         formatterManager.addFormatter("string", std::move(stringFormatter));
+        formatterManager.addFormatter("comment", std::move(commentFormatter));
         highlighter.setFormatterManager(&formatterManager);
 
         // Process entire content at once
@@ -402,59 +420,47 @@ static std::string applyHashMappingsToString(std::string str)
     return str;
 }
 
+// Unified store path transformation (glibc → hash mapping → prefix)
+// Used by: ELF interpreter, RPATH entries, symlinks
+// Order matters: glibc must be replaced before hash mappings are applied
+static std::string transformStorePath(std::string path)
+{
+    // 1. Replace old glibc with Android glibc (must be first)
+    if (!oldGlibcPath.empty() && path.find(oldGlibcPath) != std::string::npos) {
+        path = replaceAll(std::move(path), oldGlibcPath, glibcPath);
+    }
+
+    // 2. Apply hash mappings for inter-package references
+    path = applyHashMappingsToString(std::move(path));
+
+    // 3. Add prefix to /nix/store paths
+    if (path.rfind("/nix/store/", 0) == 0) {
+        path.insert(0, prefix);
+    }
+
+    return path;
+}
+
 // Patch symlink target (takes by value to allow move semantics)
 static std::string patchSymlink(std::string target)
 {
-    // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
-    // This is the same order as transformRpathEntry to ensure consistency
-    // Replace old glibc with Android glibc (for symlinks like ld.so)
-    if (!oldGlibcPath.empty()) {
-        // Try full path first (for absolute symlinks)
-        if (target.find(oldGlibcPath) != std::string::npos) {
-            target = replaceAll(std::move(target), oldGlibcPath, glibcPath);
-        } else {
-            // For relative symlinks (e.g., ../../hash-glibc-version/lib/...)
-            // Extract basenames and try to match those
-            const auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
-            const auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
-            if (!oldBase.empty() && target.find(oldBase) != std::string::npos) {
-                target = replaceAll(std::move(target), oldBase, newBase);
-            }
+    // Handle relative symlinks with glibc basename (e.g., ../../hash-glibc/lib/...)
+    // This must be done before transformStorePath since relative paths won't match oldGlibcPath
+    if (!oldGlibcPath.empty() && target.find(oldGlibcPath) == std::string::npos) {
+        const auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
+        const auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
+        if (!oldBase.empty() && target.find(oldBase) != std::string::npos) {
+            target = replaceAll(std::move(target), oldBase, newBase);
         }
     }
 
-    // Then apply hash mappings for inter-package references
-    target = applyHashMappingsToString(std::move(target));
-
-    // Finally add prefix to /nix/store paths
-    if (target.rfind("/nix/store/", 0) == 0) {
-        target.insert(0, prefix);
-    }
-
-    return target;
+    return transformStorePath(std::move(target));
 }
 
 // Transform a single RPATH entry
 static std::string transformRpathEntry(std::string entry)
 {
-    // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
-    // because hash mappings would change the path and prevent matching
-    // gcc-lib is handled by hash mapping (same package, different hash)
-
-    // Replace old glibc with new glibc (Android glibc)
-    if (!oldGlibcPath.empty() && entry.find(oldGlibcPath) != std::string::npos) {
-        entry = replaceAll(std::move(entry), oldGlibcPath, glibcPath);
-    }
-
-    // Then apply hash mappings for inter-package references (including gcc-lib)
-    entry = applyHashMappingsToString(std::move(entry));
-
-    // Add prefix to /nix/store paths (for Android glibc and other libs)
-    if (entry.rfind("/nix/store/", 0) == 0) {
-        entry.insert(0, prefix);
-    }
-
-    return entry;
+    return transformStorePath(std::move(entry));
 }
 
 // Build new RPATH from old RPATH by transforming each entry
@@ -513,26 +519,9 @@ static std::vector<std::byte> patchElfContent(
             interp.clear();
         }
 
-        // Patch interpreter
+        // Patch interpreter using unified transformation
         if (!interp.empty()) {
-            std::string newInterp = interp;
-
-            // IMPORTANT: glibc substitution MUST happen BEFORE hash mappings
-            // because hash mappings would change the path and prevent matching
-
-            // Replace old glibc interpreter with Android glibc
-            if (!oldGlibcPath.empty() && newInterp.find(oldGlibcPath) != std::string::npos) {
-                newInterp = replaceAll(std::move(newInterp), oldGlibcPath, glibcPath);
-            }
-
-            // Then apply hash mappings for inter-package references
-            newInterp = applyHashMappingsToString(std::move(newInterp));
-
-            // Add prefix to /nix/store interpreters (needed for kernel to find ld.so)
-            if (newInterp.rfind("/nix/store/", 0) == 0) {
-                newInterp.insert(0, prefix);
-            }
-
+            std::string newInterp = transformStorePath(interp);
             if (newInterp != interp) {
                 debug("  interpreter: %s -> %s\n", interp.c_str(), newInterp.c_str());
                 elfFile.setInterpreter(newInterp);
@@ -565,80 +554,76 @@ static std::vector<std::byte> patchElfContent(
     }
 }
 
-// Patch source file: shebang (if present) and string literals
-// The langFile is the detected .lang file (e.g., "sh.lang", "python.lang")
-static std::vector<std::byte> patchSource(const std::span<const std::byte> content, const std::string& langFile)
+// Patch shebang only (fallback when language detection fails)
+// Used for files with shebangs that can't be processed by source-highlight
+static std::vector<std::byte> patchShebangOnly(const std::span<const std::byte> content)
 {
-    if (prefix.empty()) {
+    if (prefix.empty() || !hasShebang(content)) {
         return std::vector<std::byte>(content.begin(), content.end());
     }
 
     std::string str(reinterpret_cast<const char*>(content.data()), content.size());
-    bool modified = false;
-    size_t contentStart = 0;  // Where string-aware patching starts
 
-    // === SHEBANG PATCHING ===
-    // Only patch shebang if the file actually has one
-    if (hasShebang(content)) {
-        // Find end of first line (shebang)
-        size_t shebangEnd = str.find('\n');
-        if (shebangEnd == std::string::npos) shebangEnd = str.size();
+    // Find end of shebang line
+    size_t shebangEnd = str.find('\n');
+    if (shebangEnd == std::string::npos) shebangEnd = str.size();
 
-        std::string shebang = str.substr(0, shebangEnd);
+    std::string shebang = str.substr(0, shebangEnd);
 
-        // Check if shebang contains /nix/store
-        if (shebang.find("/nix/store/") != std::string::npos) {
-            // Replace old glibc paths (gcc-lib handled by hash mapping)
-            std::string newShebang = shebang;
-            if (!oldGlibcPath.empty()) {
-                newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
-            }
-
-            // Apply hash mappings for inter-package references
-            newShebang = applyHashMappingsToString(std::move(newShebang));
-
-            // Add prefix to remaining /nix/store paths
-            // Look for /nix/store/ after #!
-            size_t pos = 2; // Skip #!
-            while ((pos = newShebang.find("/nix/store/", pos)) != std::string::npos) {
-                // Check if this is already prefixed
-                if (pos < prefix.length() ||
-                    newShebang.substr(pos - prefix.length(), prefix.length()) != prefix) {
-                    newShebang.insert(pos, prefix);
-                    pos += prefix.length();
-                }
-                pos += 11; // Skip "/nix/store/"
-            }
-
-            if (newShebang != shebang) {
-                debug("  shebang: %s -> %s\n", shebang.c_str(), newShebang.c_str());
-                str.replace(0, shebangEnd, newShebang);
-                // Adjust contentStart for the size difference
-                contentStart = shebangEnd + (newShebang.length() - shebang.length());
-                modified = true;
-            } else {
-                contentStart = shebangEnd;
-            }
-        } else {
-            contentStart = shebangEnd;
-        }
+    // Only patch if shebang contains /nix/store
+    if (shebang.find("/nix/store/") == std::string::npos) {
+        return {content.begin(), content.end()};
     }
 
-    // === STRING-AWARE CONTENT PATCHING ===
-    // Use one-pass approach with PreFormatter for content after shebang
-    if (!langFile.empty() && !sourceHighlightDataDir.empty()) {
-        std::string afterShebang = str.substr(contentStart);
-        std::string patchedContent = patchSourceWithHighlighter(afterShebang, langFile);
+    // Apply transformations to the shebang
+    // Note: transformStorePath only handles one path, so we need to find all paths
+    std::string newShebang = shebang;
 
-        if (patchedContent != afterShebang) {
-            str = str.substr(0, contentStart) + patchedContent;
-            modified = true;
-        }
+    // Replace glibc paths
+    if (!oldGlibcPath.empty()) {
+        newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
     }
 
-    if (modified) {
+    // Apply hash mappings
+    newShebang = applyHashMappingsToString(std::move(newShebang));
+
+    // Add prefix to all /nix/store paths
+    size_t pos = 2;  // Skip #!
+    while ((pos = newShebang.find("/nix/store/", pos)) != std::string::npos) {
+        if (pos < prefix.length() ||
+            newShebang.substr(pos - prefix.length(), prefix.length()) != prefix) {
+            newShebang.insert(pos, prefix);
+            pos += prefix.length();
+        }
+        pos += 11;  // Skip "/nix/store/"
+    }
+
+    if (newShebang != shebang) {
+        debug("  shebang (fallback): %s -> %s\n", shebang.c_str(), newShebang.c_str());
+        str.replace(0, shebangEnd, newShebang);
         std::vector<std::byte> result(str.size());
         std::memcpy(result.data(), str.data(), str.size());
+        return result;
+    }
+    return {content.begin(), content.end()};
+}
+
+// Patch source file content using source-highlight
+// Strings AND comments (including shebangs) are patched via NixPathTranslator
+static std::vector<std::byte> patchSource(
+    const std::span<const std::byte> content,
+    const std::string& langFile)
+{
+    if (prefix.empty() || langFile.empty()) {
+        return std::vector<std::byte>(content.begin(), content.end());
+    }
+
+    std::string str(reinterpret_cast<const char*>(content.data()), content.size());
+    std::string patched = patchSourceWithHighlighter(str, langFile);
+
+    if (patched != str) {
+        std::vector<std::byte> result(patched.size());
+        std::memcpy(result.data(), patched.data(), patched.size());
         return result;
     }
     return {content.begin(), content.end()};
@@ -651,66 +636,55 @@ static std::vector<std::byte> patchContent(
     const bool executable,
     const std::string& path)
 {
-    std::vector<std::byte> result;
-
-    // Extract filename from path for language detection
+    // Extract filename from path
     std::string filename;
     size_t lastSlash = path.rfind('/');
     filename = (lastSlash != std::string::npos) ? path.substr(lastSlash + 1) : path;
 
-    // ELF check MUST come first - ELF files are often large and extensionless
+    // === ELF FILES ===
     if (isElf(content)) {
         debug("  patching ELF %s (%zu bytes)\n", path.c_str(), content.size());
-        if (isElf32(content)) {
-            result = patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(
-                content, executable);
-        } else {
-            result = patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(
-                content, executable);
-        }
-    } else {
-        // Try extension-based language detection first
-        std::string langFile = langMap.getMappedFileNameFromFileName(filename);
-
-        // If no extension mapping, check skip extensions and size threshold
-        if (langFile.empty()) {
-            if (shouldSkipByExtension(filename)) {
-                // Skip non-patchable extensions (.html, .png, etc.)
-                debug("  skipping %s (non-patchable extension)\n", path.c_str());
-                result = std::vector<std::byte>(content.begin(), content.end());
-                applyHashMappings(result);
-                return result;
-            }
-
-            // Content-based detection only for small files with shebang
-            if (!sourceHighlightDataDir.empty() && hasShebang(content)) {
-                if (content.size() <= MAX_CONTENT_DETECT_SIZE) {
-                    std::string contentStr(reinterpret_cast<const char*>(content.data()), content.size());
-                    langFile = detectLanguage(contentStr);
-                } else {
-                    debug("  skipping %s (large file, no extension mapping)\n", path.c_str());
-                }
-            }
-        }
-
-        // Only process if language is in our whitelist of patchable languages
-        if (!langFile.empty() && PATCHABLE_LANG_FILES.count(langFile)) {
-            debug("  patching source %s (%zu bytes, lang=%s)\n",
-                  path.c_str(), content.size(), langFile.c_str());
-            result = patchSource(content, langFile);
-        } else {
-            if (!langFile.empty()) {
-                debug("  skipping %s (lang=%s not in whitelist)\n",
-                      path.c_str(), langFile.c_str());
-            }
-            result = std::vector<std::byte>(content.begin(), content.end());
-        }
+        auto result = isElf32(content)
+            ? patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(content, executable)
+            : patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(content, executable);
+        applyHashMappings(result);
+        return result;
     }
 
-    // Apply hash mappings for inter-package references
-    // This must be done AFTER ELF/script patching to not interfere with structure
-    applyHashMappings(result);
+    // === SKIP NON-PATCHABLE EXTENSIONS ===
+    if (shouldSkipByExtension(filename)) {
+        debug("  skipping %s (non-patchable extension)\n", path.c_str());
+        auto result = std::vector<std::byte>(content.begin(), content.end());
+        applyHashMappings(result);
+        return result;
+    }
 
+    // === LANGUAGE DETECTION ===
+    std::string langFile = langMap.getMappedFileNameFromFileName(filename);
+    if (langFile.empty() && hasShebang(content) && content.size() <= MAX_CONTENT_DETECT_SIZE) {
+        std::string str(reinterpret_cast<const char*>(content.data()), content.size());
+        langFile = detectLanguage(str);
+    }
+
+    // === SOURCE PATCHING (strings + comments including shebangs) ===
+    std::vector<std::byte> result;
+    if (!langFile.empty() && PATCHABLE_LANG_FILES.count(langFile)) {
+        debug("  patching source %s (%zu bytes, lang=%s)\n",
+              path.c_str(), content.size(), langFile.c_str());
+        result = patchSource(content, langFile);
+    } else if (hasShebang(content)) {
+        // Fallback: patch shebang only when language detection fails
+        // This handles scripts with unusual interpreters (e.g., ld.so)
+        debug("  patching shebang-only %s (%zu bytes)\n", path.c_str(), content.size());
+        result = patchShebangOnly(content);
+    } else {
+        if (!langFile.empty()) {
+            debug("  skipping %s (lang=%s not in whitelist)\n", path.c_str(), langFile.c_str());
+        }
+        result = std::vector<std::byte>(content.begin(), content.end());
+    }
+
+    applyHashMappings(result);
     return result;
 }
 
