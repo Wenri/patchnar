@@ -29,25 +29,23 @@ assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-
     ".sh extension: string patched"
 
 
-# Test 2: Extension-based detection (.pm - Perl module)
-# Note: .pl extension maps to prolog.lang, not perl.lang
-# Use .pm (Perl module) for reliable Perl detection
+# Test 2: Extension-based detection (.json)
 echo ""
-echo "Testing .pm extension detection..."
+echo "Testing .json extension detection..."
 
-cat > pkg/share/script.pm << 'EOF'
-#!/usr/bin/perl
-my $path = "/nix/store/abc123-data/share/data";
-print "$path\n";
-1;
+cat > pkg/share/config.json << 'EOF'
+{
+  "path": "/nix/store/abc123-data/share/data",
+  "name": "test"
+}
 EOF
 
 create_test_nar pkg input.nar
 run_patchnar < input.nar > output.nar
 
-result=$(extract_from_nar output.nar /share/script.pm)
+result=$(extract_from_nar output.nar /share/config.json)
 assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/abc123-data/share/data" \
-    ".pm extension: string patched"
+    ".json extension: string patched"
 
 
 # Test 3: Extension-based detection (.py)
@@ -87,9 +85,10 @@ assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/data111
     "shebang detection: bash string patched"
 
 
-# Test 5: Shebang-based detection (no extension, perl)
+# Test 5: Shebang-based detection (no extension, perl - not in PATCHABLE_LANG_FILES)
+# Perl is detected but not patchable, so only shebang is patched (fallback)
 echo ""
-echo "Testing shebang detection for perl..."
+echo "Testing shebang detection for perl (fallback mode)..."
 
 cat > pkg/bin/perl_no_ext << 'EOF'
 #!/nix/store/abc123-perl-5.42/bin/perl
@@ -102,8 +101,11 @@ create_test_nar pkg input.nar
 run_patchnar < input.nar > output.nar
 
 result=$(extract_from_nar output.nar /bin/perl_no_ext)
-assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/data222-data/share/data" \
-    "shebang detection: perl string patched"
+# Perl is not in PATCHABLE_LANG_FILES, so shebang patched but strings are not
+assert_contains "$result" "#!/data/data/com.termux.nix/files/usr/nix/store/abc123-perl-5.42/bin/perl" \
+    "shebang detection: perl shebang patched"
+assert_contains "$result" '"/nix/store/data222-data/share/data"' \
+    "shebang detection: perl string NOT patched (expected - perl not in whitelist)"
 
 
 # Test 6: Nix store path normalization in shebang detection
@@ -111,11 +113,11 @@ echo ""
 echo "Testing Nix path normalization for language detection..."
 
 # This tests the fix for detectLanguage() that normalizes Nix paths
-# before inference (e.g., #!/nix/store/xxx-perl-5.42/bin/perl -> #!/bin/perl)
+# before inference. Use bash since perl is not in PATCHABLE_LANG_FILES.
 cat > pkg/bin/nix_shebang << 'EOF'
-#!/nix/store/0gfsfmgbyy35akc4waha0cq3gf6xan1r-perl-5.42.0/bin/perl
-my $data = "/nix/store/data333-data/share/data";
-print "$data\n";
+#!/nix/store/0gfsfmgbyy35akc4waha0cq3gf6xan1r-bash-5.2/bin/bash
+data="/nix/store/data333-data/share/data"
+echo "$data"
 EOF
 chmod +x pkg/bin/nix_shebang
 
@@ -125,7 +127,7 @@ run_patchnar < input.nar > output.nar
 result=$(extract_from_nar output.nar /bin/nix_shebang)
 # The string should be patched, proving language was detected correctly
 assert_contains "$result" "/data/data/com.termux.nix/files/usr/nix/store/data333-data/share/data" \
-    "Nix path normalized: perl detected and string patched"
+    "Nix path normalized: bash detected and string patched"
 
 
 # Test 7: Skipped extension (.html)

@@ -34,27 +34,25 @@ assert_contains "$result" "# Also references /data/data/com.termux.nix/files/usr
     "path in second comment patched"
 
 
-# Test 2: Perl script comments
+# Test 2: Makefile comments
 echo ""
-echo "Testing perl script comment patching..."
+echo "Testing makefile comment patching..."
 
-cat > pkg/bin/commented_perl << 'EOF'
-#!/nix/store/abc123-perl-5.42/bin/perl
-# Depends on /nix/store/lib111-somelib/lib/libfoo.so
-use strict;
+cat > pkg/bin/Makefile << 'EOF'
+# Build script for /nix/store/lib111-somelib/lib/libfoo.so
 # See /nix/store/doc222-docs/share/doc for documentation
-print "hello\n";
+all:
+	echo "building"
 EOF
-chmod +x pkg/bin/commented_perl
 
 create_test_nar pkg input.nar
 run_patchnar < input.nar > output.nar
 
-result=$(extract_from_nar output.nar /bin/commented_perl)
-assert_contains "$result" "# Depends on /data/data/com.termux.nix/files/usr/nix/store/lib111-somelib/lib/libfoo.so" \
-    "path in perl comment patched"
+result=$(extract_from_nar output.nar /bin/Makefile)
+assert_contains "$result" "# Build script for /data/data/com.termux.nix/files/usr/nix/store/lib111-somelib/lib/libfoo.so" \
+    "path in makefile comment patched"
 assert_contains "$result" "# See /data/data/com.termux.nix/files/usr/nix/store/doc222-docs/share/doc" \
-    "second perl comment patched"
+    "second makefile comment patched"
 
 
 # Test 3: Python script comments

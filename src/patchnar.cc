@@ -662,7 +662,7 @@ static std::vector<std::byte> patchContent(
 
     // === LANGUAGE DETECTION ===
     std::string langFile = langMap.getMappedFileNameFromFileName(filename);
-    if (langFile.empty() && hasShebang(content) && content.size() <= MAX_CONTENT_DETECT_SIZE) {
+    if (langFile.empty() && content.size() <= MAX_CONTENT_DETECT_SIZE) {
         std::string str(reinterpret_cast<const char*>(content.data()), content.size());
         langFile = detectLanguage(str);
     }

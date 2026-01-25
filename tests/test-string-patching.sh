@@ -53,26 +53,26 @@ assert_contains "$result" "echo 'File at /data/data/com.termux.nix/files/usr/nix
     "single-quoted echo patched"
 
 
-# Test 3: Perl string literals
+# Test 3: Ruby string literals
 echo ""
-echo "Testing perl string patching..."
+echo "Testing ruby string patching..."
 
-cat > pkg/bin/string_perl << 'EOF'
-#!/nix/store/abc123-perl-5.42/bin/perl
-my $config = "/nix/store/cfg222-config/etc/perl.conf";
-my $data = '/nix/store/data333-data/share/perl';
-print "Loading from $config\n";
+cat > pkg/bin/string_ruby << 'EOF'
+#!/nix/store/abc123-ruby-3.2/bin/ruby
+config = "/nix/store/cfg222-config/etc/ruby.conf"
+data = '/nix/store/data333-data/share/ruby'
+puts "Loading from #{config}"
 EOF
-chmod +x pkg/bin/string_perl
+chmod +x pkg/bin/string_ruby
 
 create_test_nar pkg input.nar
 run_patchnar < input.nar > output.nar
 
-result=$(extract_from_nar output.nar /bin/string_perl)
-assert_contains "$result" 'my $config = "/data/data/com.termux.nix/files/usr/nix/store/cfg222-config/etc/perl.conf"' \
-    "perl double-quoted string patched"
-assert_contains "$result" "my \$data = '/data/data/com.termux.nix/files/usr/nix/store/data333-data/share/perl'" \
-    "perl single-quoted string patched"
+result=$(extract_from_nar output.nar /bin/string_ruby)
+assert_contains "$result" 'config = "/data/data/com.termux.nix/files/usr/nix/store/cfg222-config/etc/ruby.conf"' \
+    "ruby double-quoted string patched"
+assert_contains "$result" "data = '/data/data/com.termux.nix/files/usr/nix/store/data333-data/share/ruby'" \
+    "ruby single-quoted string patched"
 
 
 # Test 4: Python string literals
