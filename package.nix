@@ -12,7 +12,6 @@
   # Default is standard nix-on-droid path
   installationDir ? "/data/data/com.termux.nix/files/usr",
 }:
-
 # Use GCC 14 stdenv for C++23 support (std::generator)
 gcc14Stdenv.mkDerivation {
   pname = "patchnar";
