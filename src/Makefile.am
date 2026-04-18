@@ -29,6 +29,8 @@ patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
 patchelf_SOURCES = patchelf.cc elf.h patchelf.h
 patchelf_CXXFLAGS = $(AM_CXXFLAGS)
 
-# bun_graph - Parse Bun --compile ELF standalone module graph (uses patchelf as library)
+# bun_graph - Parse Bun --compile ELF standalone module graph
+# Uses patchelf as library + source-highlight for JS string patching
 bun_graph_SOURCES = bun_graph.cc patchelf.cc elf.h patchelf.h
-bun_graph_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY
+bun_graph_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS)
+bun_graph_LDADD = $(SOURCE_HIGHLIGHT_LIBS)

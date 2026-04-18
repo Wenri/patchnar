@@ -19,6 +19,18 @@
 #include "elf.h"
 #include "patchelf.h"
 
+// Source-highlight for syntax-aware string replacement in JS modules
+#include <srchilite/sourcehighlighter.h>
+#include <srchilite/formattermanager.h>
+#include <srchilite/formatter.h>
+#include <srchilite/formatterparams.h>
+#include <srchilite/langdefmanager.h>
+#include <srchilite/regexrulefactory.h>
+#include <srchilite/textstyleformatter.h>
+#include <srchilite/bufferedoutput.h>
+#include <srchilite/chartranslator.h>
+#include <sstream>
+
 // ElfFile type aliases for cleaner template dispatch
 using ElfFile32 = ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off,
     Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux,
@@ -152,6 +164,66 @@ static bool write_file(const std::string& path, const uint8_t* data, size_t len)
     }
     close(fd);
     return true;
+}
+
+static bool write_file(const std::string& path, const std::string& content) {
+    return write_file(path, reinterpret_cast<const uint8_t*>(content.data()), content.size());
+}
+
+// Source-highlight data directory (compile-time constant from configure)
+static const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
+
+// Translator that replaces /$bunfs with the output directory inside string literals.
+class BunfsTranslator : public srchilite::CharTranslator {
+    std::string from;
+    std::string to;
+public:
+    BunfsTranslator(const std::string& outdir)
+        : srchilite::CharTranslator(), from("/$bunfs"), to(outdir) {}
+protected:
+    const std::string doPreformat(const std::string& text) override {
+        std::string result = text;
+        size_t pos = 0;
+        while ((pos = result.find(from, pos)) != std::string::npos) {
+            result.replace(pos, from.length(), to);
+            pos += to.length();
+        }
+        return result;
+    }
+};
+
+// Patch JS source: replace /$bunfs with outdir only inside string literals.
+static std::string patchJsStrings(const std::string& content, const std::string& outdir) {
+    try {
+        srchilite::RegexRuleFactory ruleFactory;
+        srchilite::LangDefManager langDefManager(&ruleFactory);
+        srchilite::SourceHighlighter highlighter(
+            langDefManager.getHighlightState(sourceHighlightDataDir, "javascript.lang"));
+        highlighter.setOptimize(false);
+
+        std::ostringstream outputStream;
+        srchilite::BufferedOutput bufferedOutput(outputStream);
+
+        // Identity formatter for non-string elements (outputs as-is)
+        auto identityFormatter = std::make_unique<srchilite::TextStyleFormatter>(
+            "$text", &bufferedOutput);
+
+        // String formatter with /$bunfs path translation
+        BunfsTranslator translator(outdir);
+        auto stringFormatter = std::make_unique<srchilite::TextStyleFormatter>(
+            "$text", &bufferedOutput);
+        stringFormatter->setPreFormatter(&translator);
+
+        srchilite::FormatterManager formatterManager(std::move(identityFormatter));
+        formatterManager.addFormatter("string", std::move(stringFormatter));
+        highlighter.setFormatterManager(&formatterManager);
+
+        highlighter.highlightParagraph(content);
+        return outputStream.str();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "  JS patching failed: %s\n", e.what());
+        return content;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -327,9 +399,18 @@ int main(int argc, char** argv) {
                 continue;
             }
             size_t creal = (size_t)e.stored_content_off + OFFSET_BIAS;
-            if (!write_file(full, sec + creal, e.content_len)) return 1;
-            printf("  %s (%u bytes, %s)\n",
-                   full.c_str(), e.content_len, e.kind);
+            if (strcmp(e.kind, "js") == 0) {
+                // Patch JS: replace /$bunfs with outdir inside string literals
+                std::string src(reinterpret_cast<const char*>(sec + creal), e.content_len);
+                std::string patched = patchJsStrings(src, outdir);
+                if (!write_file(full, patched)) return 1;
+                printf("  %s (%zu bytes, %s, patched)\n",
+                       full.c_str(), patched.size(), e.kind);
+            } else {
+                if (!write_file(full, sec + creal, e.content_len)) return 1;
+                printf("  %s (%u bytes, %s)\n",
+                       full.c_str(), e.content_len, e.kind);
+            }
             ++ok;
         }
         printf("extracted: %zu, skipped (name-only): %zu, refused (unsafe path): %zu\n",
