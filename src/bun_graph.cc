@@ -1,5 +1,5 @@
-// bun_graph.cpp - Parse a Bun --compile ELF and print its Standalone Module Graph.
-//   build:  g++ -std=c++17 -O2 -o bun_graph bun_graph.cpp
+// bun_graph.cc - Parse a Bun --compile ELF and print its Standalone Module Graph.
+//   part of patchnar - built via autotools
 //   run:    ./bun_graph <claude-bin> [--extract [outdir]]
 
 #include <cstdint>

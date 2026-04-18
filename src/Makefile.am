@@ -30,5 +30,5 @@ patchelf_SOURCES = patchelf.cc elf.h patchelf.h
 patchelf_CXXFLAGS = $(AM_CXXFLAGS)
 
 # bun_graph - Parse Bun --compile ELF standalone module graph
-bun_graph_SOURCES = bun_graph.cpp
+bun_graph_SOURCES = bun_graph.cc
 bun_graph_CXXFLAGS = $(AM_CXXFLAGS)
