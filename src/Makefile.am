@@ -17,13 +17,17 @@ AM_CXXFLAGS += $(SAN_FLAGS)
 endif
 endif
 
-bin_PROGRAMS = patchnar bun_graph
+bin_PROGRAMS = patchnar patchelf bun_graph
 
 # patchnar uses patchelf as library (PATCHELF_AS_LIBRARY excludes main)
 # Links against source-highlight for language detection
 patchnar_SOURCES = patchnar.cc nar.cc nar.h patchelf.cc elf.h patchelf.h
 patchnar_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS)
 patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
+
+# patchelf - standalone ELF binary patcher
+patchelf_SOURCES = patchelf.cc elf.h patchelf.h
+patchelf_CXXFLAGS = $(AM_CXXFLAGS)
 
 # bun_graph - Parse Bun --compile ELF standalone module graph
 bun_graph_SOURCES = bun_graph.cpp
