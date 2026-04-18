@@ -29,6 +29,6 @@ patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
 patchelf_SOURCES = patchelf.cc elf.h patchelf.h
 patchelf_CXXFLAGS = $(AM_CXXFLAGS)
 
-# bun_graph - Parse Bun --compile ELF standalone module graph
-bun_graph_SOURCES = bun_graph.cc
-bun_graph_CXXFLAGS = $(AM_CXXFLAGS)
+# bun_graph - Parse Bun --compile ELF standalone module graph (uses patchelf as library)
+bun_graph_SOURCES = bun_graph.cc patchelf.cc elf.h patchelf.h
+bun_graph_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY

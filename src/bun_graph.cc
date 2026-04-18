@@ -1,93 +1,79 @@
 // bun_graph.cc - Parse a Bun --compile ELF and print its Standalone Module Graph.
-//   part of patchnar - built via autotools
-//   run:    ./bun_graph <claude-bin> [--extract [outdir]]
+//   part of patchnar - built via autotools (shares ElfFile from patchelf)
+//   run:    ./bun_graph <bun-compiled-elf> [--extract [outdir]]
 
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cinttypes>
-#include <elf.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <memory>
 #include <cerrno>
+
+#include "elf.h"
+#include "patchelf.h"
+
+// ElfFile type aliases for cleaner template dispatch
+using ElfFile32 = ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off,
+    Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux,
+    Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>;
+using ElfFile64 = ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off,
+    Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux,
+    Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>;
 
 static const char BUN_MAGIC[] = "\n---- Bun! ----\n";
 static constexpr size_t BUN_MAGIC_LEN = 16;
 static constexpr size_t OFFSET_BIAS = 8;   // stored offsets are ELF-file-offset minus 8
-
-struct Mapping {
-    const uint8_t* data{};
-    size_t size{};
-    int fd{-1};
-    ~Mapping() {
-        if (data) munmap(const_cast<uint8_t*>(data), size);
-        if (fd >= 0) close(fd);
-    }
-};
-
-static bool map_file(const char* path, Mapping& m) {
-    m.fd = open(path, O_RDONLY);
-    if (m.fd < 0) { perror("open"); return false; }
-    struct stat st{};
-    if (fstat(m.fd, &st) < 0) { perror("fstat"); return false; }
-    m.size = st.st_size;
-    void* p = mmap(nullptr, m.size, PROT_READ, MAP_PRIVATE, m.fd, 0);
-    if (p == MAP_FAILED) { perror("mmap"); return false; }
-    m.data = static_cast<const uint8_t*>(p);
-    return true;
-}
 
 struct BunSection {
     size_t file_offset;
     size_t size;
 };
 
-static bool find_bun_section(const Mapping& m, BunSection& out) {
-    if (m.size < sizeof(Elf64_Ehdr)) return false;
-    auto ehdr = reinterpret_cast<const Elf64_Ehdr*>(m.data);
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "not an ELF file\n"); return false;
+// Read file into a FileContents (shared_ptr<vector<unsigned char>>)
+static FileContents readFileContents(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("open"); return {}; }
+    struct stat st{};
+    if (fstat(fd, &st) < 0) { perror("fstat"); close(fd); return {}; }
+    auto contents = std::make_shared<std::vector<unsigned char>>(st.st_size);
+    size_t bytesRead = 0;
+    ssize_t n;
+    while ((n = read(fd, contents->data() + bytesRead, st.st_size - bytesRead)) > 0)
+        bytesRead += n;
+    close(fd);
+    if (bytesRead != static_cast<size_t>(st.st_size)) {
+        fprintf(stderr, "short read on %s\n", path);
+        return {};
     }
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "only ELF64 supported\n"); return false;
-    }
+    return contents;
+}
 
-    auto range_fits = [&](size_t off, size_t len) {
-        return off <= m.size && len <= m.size - off;
-    };
+// Check ELF class from raw file contents
+static bool isElf32(const FileContents& fc) {
+    return fc->size() > EI_CLASS && (*fc)[EI_CLASS] == ELFCLASS32;
+}
 
-    if (ehdr->e_shnum == 0 || ehdr->e_shstrndx >= ehdr->e_shnum) return false;
-    if (!range_fits(ehdr->e_shoff,
-                    static_cast<size_t>(ehdr->e_shnum) * sizeof(Elf64_Shdr))) {
+// Find the .bun section using patchelf's ElfFile (handles endianness + bounds checks)
+template<class ElfFileType>
+static bool findBunSection(FileContents fc, BunSection& out) {
+    try {
+        ElfFileType elfFile(fc);
+        auto info = elfFile.findSection(".bun");
+        if (!info) return false;
+        out.file_offset = info->offset;
+        out.size = info->size;
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "ELF error: %s\n", e.what());
         return false;
     }
-    auto shdrs = reinterpret_cast<const Elf64_Shdr*>(m.data + ehdr->e_shoff);
-
-    const Elf64_Shdr& strsh = shdrs[ehdr->e_shstrndx];
-    if (!range_fits(strsh.sh_offset, strsh.sh_size) || strsh.sh_size == 0) {
-        return false;
-    }
-    const char* shstr = reinterpret_cast<const char*>(m.data + strsh.sh_offset);
-
-    for (size_t i = 0; i < ehdr->e_shnum; ++i) {
-        if (shdrs[i].sh_name >= strsh.sh_size) return false;
-        // Ensure the name is NUL-terminated within the string table.
-        size_t max_name = strsh.sh_size - shdrs[i].sh_name;
-        if (strnlen(shstr + shdrs[i].sh_name, max_name) == max_name) return false;
-        if (strcmp(shstr + shdrs[i].sh_name, ".bun") == 0) {
-            if (!range_fits(shdrs[i].sh_offset, shdrs[i].sh_size)) return false;
-            out.file_offset = shdrs[i].sh_offset;
-            out.size = shdrs[i].sh_size;
-            return true;
-        }
-    }
-    return false;
 }
 
 // A resolved entry discovered in the directory region.
@@ -193,17 +179,23 @@ int main(int argc, char** argv) {
         }
     }
 
-    Mapping m;
-    if (!map_file(argv[1], m)) return 1;
+    // Read file into memory using patchelf's FileContents type
+    auto fileContents = readFileContents(argv[1]);
+    if (!fileContents) return 1;
 
+    // Find .bun section using patchelf's ElfFile (handles ELF32/64 + endianness)
     BunSection bun;
-    if (!find_bun_section(m, bun)) {
+    bool found = isElf32(fileContents)
+        ? findBunSection<ElfFile32>(fileContents, bun)
+        : findBunSection<ElfFile64>(fileContents, bun);
+    if (!found) {
         fprintf(stderr, ".bun section not found\n"); return 1;
     }
     printf(".bun section: file_offset=0x%zx size=0x%zx (%zu bytes)\n",
            bun.file_offset, bun.size, bun.size);
 
-    const uint8_t* sec = m.data + bun.file_offset;
+    const uint8_t* data = fileContents->data();
+    const uint8_t* sec = data + bun.file_offset;
     if (bun.size < BUN_MAGIC_LEN ||
         memcmp(sec + bun.size - BUN_MAGIC_LEN, BUN_MAGIC, BUN_MAGIC_LEN) != 0) {
         fprintf(stderr, "Bun trailer magic not found\n"); return 1;

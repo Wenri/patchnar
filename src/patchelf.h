@@ -4,6 +4,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "elf.h"
@@ -71,6 +73,16 @@ public:
     {
         return changed;
     }
+
+    /* Result type for findSection() queries. */
+    struct SectionInfo {
+        size_t offset;
+        size_t size;
+    };
+
+    /* Find a section by name and return its file offset and size.
+       Returns nullopt if the section is not found. */
+    [[nodiscard]] std::optional<SectionInfo> findSection(const std::string & sectionName) const;
 
 private:
 
