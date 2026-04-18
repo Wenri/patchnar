@@ -1,6 +1,6 @@
 // bun_graph.cc - Parse a Bun --compile ELF and print its Standalone Module Graph.
 //   part of patchnar - built via autotools (shares ElfFile from patchelf)
-//   run:    ./bun_graph <bun-compiled-elf> [--extract [outdir]]
+//   run:    ./bun_graph <bun-compiled-elf> [--extract DIR]
 
 #include <cstdint>
 #include <cstring>
@@ -124,13 +124,13 @@ static bool is_safe_relative(const std::string& p) {
     return true;
 }
 
-// Map an internal /$bunfs/... path to a relative output path.
-// Strips the "/$bunfs/" prefix, preserving the "root/" directory structure.
-static std::string output_path(const std::string& bunfs) {
-    const char prefix[] = "/$bunfs/";
-    if (bunfs.size() > sizeof(prefix) - 1 &&
+// Map an internal /$bunfs/... path to an output path.
+// Replaces the "/$bunfs" prefix with the user-specified output directory.
+static std::string output_path(const std::string& bunfs, const std::string& outdir) {
+    const char prefix[] = "/$bunfs";
+    if (bunfs.size() >= sizeof(prefix) - 1 &&
         memcmp(bunfs.data(), prefix, sizeof(prefix) - 1) == 0) {
-        return bunfs.substr(sizeof(prefix) - 1);
+        return outdir + bunfs.substr(sizeof(prefix) - 1);
     }
     return bunfs;
 }
@@ -156,18 +156,23 @@ static bool write_file(const std::string& path, const uint8_t* data, size_t len)
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract [outdir]]\n", argv[0]);
+        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract DIR]\n", argv[0]);
         return 1;
     }
 
     bool extract = false;
-    std::string outdir = ".";
+    std::string outdir = "/$bunfs";
     for (int ai = 2; ai < argc; ++ai) {
         if (strcmp(argv[ai], "--extract") == 0) {
-            extract = true;
-            if (ai + 1 < argc && argv[ai + 1][0] != '-') {
-                outdir = argv[++ai];
+            if (ai + 1 >= argc) {
+                fprintf(stderr, "--extract requires a directory argument\n");
+                return 1;
             }
+            extract = true;
+            outdir = argv[++ai];
+            // Strip trailing slash for clean path joining
+            while (outdir.size() > 1 && outdir.back() == '/')
+                outdir.pop_back();
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[ai]);
             return 1;
@@ -295,12 +300,13 @@ int main(int argc, char** argv) {
         i += 4;
     }
 
-    printf("\n%-4s %-40s %-12s %-10s %-12s %-10s %s\n",
-           "idx", "name", "name_off", "name_len", "content_off", "content_len", "kind");
+    printf("\n%-4s %-50s %-12s %-10s %-12s %-10s %s\n",
+           "idx", "path", "name_off", "name_len", "content_off", "content_len", "kind");
     for (size_t k = 0; k < entries.size(); ++k) {
         const auto& e = entries[k];
-        printf("%-4zu %-40s 0x%010x %-10u 0x%010x %-10u %s\n",
-               k, e.name.c_str(),
+        std::string path = output_path(e.name, outdir);
+        printf("%-4zu %-50s 0x%010x %-10u 0x%010x %-10u %s\n",
+               k, path.c_str(),
                e.stored_name_off, e.name_len,
                e.stored_content_off, e.content_len,
                e.kind);
@@ -310,24 +316,20 @@ int main(int argc, char** argv) {
     printf("(stored offsets are section-relative; add 8 to dereference)\n");
 
     if (extract) {
-        printf("\n--- extracting to %s/ ---\n", outdir.c_str());
-        if (mkdir(outdir.c_str(), 0755) < 0 && errno != EEXIST) {
-            perror(("mkdir " + outdir).c_str()); return 1;
-        }
+        printf("\n--- extracting ---\n");
         size_t ok = 0, skipped = 0, unsafe = 0;
         for (const auto& e : entries) {
             if (!e.has_content) { ++skipped; continue; }
-            std::string rel = output_path(e.name);
-            if (!is_safe_relative(rel)) {
-                fprintf(stderr, "  refusing unsafe path: %s\n", e.name.c_str());
+            std::string full = output_path(e.name, outdir);
+            if (!is_safe_relative(full) && full.front() != '/') {
+                fprintf(stderr, "  refusing unsafe path: %s\n", full.c_str());
                 ++unsafe;
                 continue;
             }
-            std::string full = outdir + "/" + rel;
             size_t creal = (size_t)e.stored_content_off + OFFSET_BIAS;
             if (!write_file(full, sec + creal, e.content_len)) return 1;
-            printf("  %-40s -> %s (%u bytes, %s)\n",
-                   e.name.c_str(), full.c_str(), e.content_len, e.kind);
+            printf("  %s (%u bytes, %s)\n",
+                   full.c_str(), e.content_len, e.kind);
             ++ok;
         }
         printf("extracted: %zu, skipped (name-only): %zu, refused (unsafe path): %zu\n",
