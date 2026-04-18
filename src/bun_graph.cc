@@ -125,17 +125,12 @@ static bool is_safe_relative(const std::string& p) {
 }
 
 // Map an internal /$bunfs/... path to a relative output path.
-// Strips the "/$bunfs/root/" prefix if present, otherwise drops the leading "/$bunfs/".
+// Strips the "/$bunfs/" prefix, preserving the "root/" directory structure.
 static std::string output_path(const std::string& bunfs) {
-    const char prefix_root[] = "/$bunfs/root/";
-    const char prefix_bare[] = "/$bunfs/";
-    if (bunfs.size() > sizeof(prefix_root) - 1 &&
-        memcmp(bunfs.data(), prefix_root, sizeof(prefix_root) - 1) == 0) {
-        return bunfs.substr(sizeof(prefix_root) - 1);
-    }
-    if (bunfs.size() > sizeof(prefix_bare) - 1 &&
-        memcmp(bunfs.data(), prefix_bare, sizeof(prefix_bare) - 1) == 0) {
-        return bunfs.substr(sizeof(prefix_bare) - 1);
+    const char prefix[] = "/$bunfs/";
+    if (bunfs.size() > sizeof(prefix) - 1 &&
+        memcmp(bunfs.data(), prefix, sizeof(prefix) - 1) == 0) {
+        return bunfs.substr(sizeof(prefix) - 1);
     }
     return bunfs;
 }
