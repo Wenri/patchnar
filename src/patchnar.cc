@@ -30,26 +30,15 @@
 #include <string_view>
 #include <vector>
 
-// Source-highlight includes for string literal tokenization (required)
-#include <srchilite/sourcehighlighter.h>
-#include <srchilite/formattermanager.h>
-#include <srchilite/formatter.h>
-#include <srchilite/formatterparams.h>
-#include <srchilite/langdefmanager.h>
-#include <srchilite/regexrulefactory.h>
+// Source-highlight: shared tokenization from source_patcher + CharTranslator for path translation
+#include "source_patcher.h"
 #include <srchilite/langmap.h>
 #include <srchilite/languageinfer.h>
-#include <srchilite/textstyleformatter.h>
-#include <srchilite/bufferedoutput.h>
-#include <srchilite/chartranslator.h>
 #include <boost/regex.hpp>
 
 // Configuration (compile-time constants from configure)
 static const std::string prefix = INSTALL_PREFIX;
 static const std::string oldGlibcPath = OLD_GLIBC_PATH;
-// Pre-escaped for regex (uses $& for match reference in Boost format)
-static const std::string escapedOldGlibc = boost::regex_replace(
-    oldGlibcPath, boost::regex(R"([.^$|()[\]{}*+?\\])"), R"(\\$&)");
 
 // Runtime configuration
 static std::string glibcPath;
@@ -59,9 +48,7 @@ static bool debugMode = false;
 // Default includes /nix/var/ which is commonly needed for nix daemon scripts
 static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
-// Source-highlight data directory (set at compile time via configure)
-// configure.ac auto-detects from pkg-config or uses --with-source-highlight-data-dir
-static const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
+
 
 // Language map for extension -> .lang file lookup (loaded once at startup)
 static srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
@@ -81,7 +68,9 @@ public:
     NixPathTranslator() : srchilite::CharTranslator() {
         // Use CharTranslator's regex for glibc path replacement
         if (!oldGlibcPath.empty() && !glibcPath.empty()) {
-            set_translation(escapedOldGlibc, glibcPath);
+            static const auto escaped = boost::regex_replace(
+                oldGlibcPath, boost::regex(R"([.^$|()[\]{}*+?\\])"), R"(\\$&)");
+            set_translation(escaped, glibcPath);
         }
     }
 
@@ -236,59 +225,6 @@ static std::string detectLanguage(const std::string& content)
     return "";
 }
 
-// One-pass source patching using PreFormatter
-// Tokenizes content and applies path translation to strings AND comments (including shebangs)
-static std::string patchSourceWithHighlighter(
-    const std::string& content,
-    const std::string& langFile)
-{
-    try {
-        debug("  tokenizing and patching with %s\n", langFile.c_str());
-
-        srchilite::RegexRuleFactory ruleFactory;
-        srchilite::LangDefManager langDefManager(&ruleFactory);
-        srchilite::SourceHighlighter highlighter(
-            langDefManager.getHighlightState(sourceHighlightDataDir, langFile));
-        highlighter.setOptimize(false);
-
-        // Output collection
-        std::ostringstream outputStream;
-        srchilite::BufferedOutput bufferedOutput(outputStream);
-
-        // Identity formatter for non-patchable elements (outputs text as-is)
-        auto identityFormatter = std::make_unique<srchilite::TextStyleFormatter>(
-            "$text", &bufferedOutput);
-
-        // Path translator shared by string and comment formatters
-        NixPathTranslator translator;
-
-        // String formatter with path translation
-        auto stringFormatter = std::make_unique<srchilite::TextStyleFormatter>(
-            "$text", &bufferedOutput);
-        stringFormatter->setPreFormatter(&translator);
-
-        // Comment formatter with path translation (handles shebangs!)
-        // Shebangs like #!/nix/store/xxx/bin/bash are recognized as comments
-        auto commentFormatter = std::make_unique<srchilite::TextStyleFormatter>(
-            "$text", &bufferedOutput);
-        commentFormatter->setPreFormatter(&translator);
-
-        // Register formatters
-        srchilite::FormatterManager formatterManager(std::move(identityFormatter));
-        formatterManager.addFormatter("string", std::move(stringFormatter));
-        formatterManager.addFormatter("comment", std::move(commentFormatter));
-        highlighter.setFormatterManager(&formatterManager);
-
-        // Process entire content at once
-        highlighter.highlightParagraph(content);
-
-        return outputStream.str();
-
-    } catch (const std::exception& e) {
-        debug("  source-highlight patching failed: %s\n", e.what());
-        return content;
-    }
-}
 
 // Add a single hash mapping from full store paths
 // Extracts basenames and validates length match
@@ -609,7 +545,8 @@ static std::vector<std::byte> patchSource(
     }
 
     std::string str(reinterpret_cast<const char*>(content.data()), content.size());
-    std::string patched = patchSourceWithHighlighter(str, langFile);
+    NixPathTranslator translator;
+    std::string patched = patchSourceStrings(str, langFile, translator);
 
     if (patched != str) {
         std::vector<std::byte> result(patched.size());

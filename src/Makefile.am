@@ -21,7 +21,7 @@ bin_PROGRAMS = patchnar patchelf bun_graph
 
 # patchnar uses patchelf as library (PATCHELF_AS_LIBRARY excludes main)
 # Links against source-highlight for language detection
-patchnar_SOURCES = patchnar.cc nar.cc nar.h patchelf.cc elf.h patchelf.h
+patchnar_SOURCES = patchnar.cc nar.cc nar.h patchelf.cc elf.h patchelf.h source_patcher.cc source_patcher.h
 patchnar_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS)
 patchnar_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
 
@@ -30,7 +30,7 @@ patchelf_SOURCES = patchelf.cc elf.h patchelf.h
 patchelf_CXXFLAGS = $(AM_CXXFLAGS)
 
 # bun_graph - Parse Bun --compile ELF standalone module graph
-# Uses patchelf as library + source-highlight for JS string patching
-bun_graph_SOURCES = bun_graph.cc patchelf.cc elf.h patchelf.h
+# Uses patchelf as library + source_patcher for JS string patching
+bun_graph_SOURCES = bun_graph.cc patchelf.cc elf.h patchelf.h source_patcher.cc source_patcher.h
 bun_graph_CXXFLAGS = $(AM_CXXFLAGS) -DPATCHELF_AS_LIBRARY $(SOURCE_HIGHLIGHT_CFLAGS)
 bun_graph_LDADD = $(SOURCE_HIGHLIGHT_LIBS)
