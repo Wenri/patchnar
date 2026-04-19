@@ -15,7 +15,6 @@
 #include <vector>
 #include <memory>
 #include <cerrno>
-#include <unordered_map>
 
 #include "elf.h"
 #include "patchelf.h"
@@ -33,7 +32,8 @@ using ElfFile64 = ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_
 
 static const char BUN_MAGIC[] = "\n---- Bun! ----\n";
 static constexpr size_t BUN_MAGIC_LEN = 16;
-static constexpr size_t OFFSET_BIAS = 8;   // stored offsets are ELF-file-offset minus 8
+static constexpr size_t BLOB_HEADER_SIZE = 8;  // [u64 payload_len] before payload data
+
 
 struct BunSection {
     size_t file_offset;
@@ -212,109 +212,134 @@ int main(int argc, char** argv) {
            bun.file_offset, bun.size, bun.size);
 
     const uint8_t* data = fileContents->data();
-    const uint8_t* sec = data + bun.file_offset;
+    // The .bun ELF section starts with [u64 payload_len][payload bytes].
+    // All StringPointer offsets in Bun's format are relative to payload start.
+    // Adjust sec to point to payload and bun.size to payload length.
+    const uint8_t* sec = data + bun.file_offset + BLOB_HEADER_SIZE;
+    bun.size -= BLOB_HEADER_SIZE;
     if (bun.size < BUN_MAGIC_LEN ||
         memcmp(sec + bun.size - BUN_MAGIC_LEN, BUN_MAGIC, BUN_MAGIC_LEN) != 0) {
         fprintf(stderr, "Bun trailer magic not found\n"); return 1;
     }
     printf("trailer magic: OK ('\\n---- Bun! ----\\n')\n");
 
-    // Footer (immediately before magic), observed layout:
-    //   u32 version/flags   (0x0001000a)
-    //   u64 ptr_to_end      (near section end)
-    //   u32 dir_offset      (ELF file offset of directory start)
-    //   u32 dir_size        (directory region length in bytes)
-    //   u32 padding
-    //   u64 ptr_secondary
-    //   u32 trailer_len_or_count
-    //   <magic>
-    static constexpr size_t FOOTER_LEN = 36;  // bytes before the magic
+    // Footer: Bun's Offsets struct (immediately before magic)
+    //   Layout (x86_64):
+    //     u64 byte_count          (total payload size)
+    //     u32 modules_ptr.offset  (offset of modules array in payload)
+    //     u32 modules_ptr.length  (size of modules array in bytes)
+    //     u32 entry_point_id
+    //     u32 exec_argv.offset
+    //     u32 exec_argv.length
+    //     u32 flags
+    //   Total: 32 bytes
+    static constexpr size_t FOOTER_LEN = 32;  // Offsets struct size
     if (bun.size < BUN_MAGIC_LEN + FOOTER_LEN) {
         fprintf(stderr, ".bun section too small for footer (%zu bytes)\n", bun.size);
         return 1;
     }
     size_t fe = bun.size - BUN_MAGIC_LEN;
 
-    uint32_t trailer_tag;    memcpy(&trailer_tag,    sec + fe -  4, 4);
-    uint64_t ptr_secondary;  memcpy(&ptr_secondary,  sec + fe - 12, 8);
-    uint32_t pad;            memcpy(&pad,            sec + fe - 16, 4);
-    uint32_t dir_size;       memcpy(&dir_size,       sec + fe - 20, 4);
+    // Read Offsets struct fields (from end, backwards):
+    //   fe-32: byte_count (u64)
+    //   fe-24: modules_ptr.offset (u32) = dir_off
+    //   fe-20: modules_ptr.length (u32) = dir_size
+    //   fe-16: entry_point_id (u32)
+    //   fe-12: exec_argv.offset (u32)
+    //   fe-8:  exec_argv.length (u32)
+    //   fe-4:  flags (u32)
+    uint64_t byte_count;     memcpy(&byte_count,     sec + fe - 32, 8);
     uint32_t dir_off;        memcpy(&dir_off,        sec + fe - 24, 4);
-    uint64_t ptr_primary;    memcpy(&ptr_primary,    sec + fe - 32, 8);
-    uint32_t flags_hdr;      memcpy(&flags_hdr,      sec + fe - 36, 4);
+    uint32_t dir_size;       memcpy(&dir_size,       sec + fe - 20, 4);
+    uint32_t entry_point_id; memcpy(&entry_point_id, sec + fe - 16, 4);
+    uint32_t argv_off;       memcpy(&argv_off,       sec + fe - 12, 4);
+    uint32_t argv_len;       memcpy(&argv_len,       sec + fe -  8, 4);
+    uint32_t flags;          memcpy(&flags,          sec + fe -  4, 4);
 
-    printf("\n--- footer ---\n");
-    printf("  flags/version : 0x%08x\n", flags_hdr);
-    printf("  ptr_primary   : 0x%" PRIx64 "\n", ptr_primary);
-    printf("  dir_offset    : 0x%08x  (.bun-relative)\n", dir_off);
-    printf("  dir_size      : 0x%08x  (%u bytes)\n", dir_size, dir_size);
-    printf("  ptr_secondary : 0x%" PRIx64 "\n", ptr_secondary);
-    printf("  trailer_tag   : 0x%08x\n", trailer_tag);
+    printf("\n--- footer (Offsets struct) ---\n");
+    printf("  byte_count      : 0x%" PRIx64 " (%zu)\n", byte_count, (size_t)byte_count);
+    printf("  modules_ptr     : {off=0x%08x, len=0x%08x} (%u bytes)\n", dir_off, dir_size, dir_size);
+    printf("  entry_point_id  : %u\n", entry_point_id);
+    printf("  exec_argv       : {off=0x%08x, len=0x%08x}\n", argv_off, argv_len);
+    printf("  flags           : 0x%08x\n", flags);
 
-    // dir_off is section-relative (offset within the .bun section)
+    // dir_off is payload-relative (offset within the payload data)
     if ((size_t)dir_off + dir_size > bun.size) {
         fprintf(stderr, "directory out of .bun section\n"); return 1;
     }
     const uint8_t* dir = sec + dir_off;
 
-    // Scan the directory for (u32 stored_offset, u32 length) pairs that resolve to
-    // either "/$bunfs/..." paths or "// @bun ..." content blocks. Records in the
-    // observed format place name_off/len immediately followed by content_off/len,
-    // so we pair a found name with the content pair right after it.
+    // Parse the directory as an array of CompiledModuleGraphFile structs.
+    // Each struct is 52 bytes (from Bun's StandaloneModuleGraph.zig):
+    //   name:                StringPointer {u32 off, u32 len}   bytes  0-7
+    //   contents:            StringPointer {u32 off, u32 len}   bytes  8-15
+    //   sourcemap:           StringPointer {u32 off, u32 len}   bytes 16-23
+    //   bytecode:            StringPointer {u32 off, u32 len}   bytes 24-31
+    //   module_info:         StringPointer {u32 off, u32 len}   bytes 32-39
+    //   bytecode_origin_path:StringPointer {u32 off, u32 len}   bytes 40-47
+    //   encoding:            u8                                  byte  48
+    //   loader:              u8                                  byte  49
+    //   module_format:       u8                                  byte  50
+    //   side:                u8                                  byte  51
+    static constexpr size_t MODULE_RECORD_SIZE = 52;
     printf("\n--- directory records ---\n");
     std::vector<Entry> entries;
-    size_t i = 0;
-    while (i + 8 <= dir_size) {
-        uint32_t off, ln;
-        memcpy(&off,  dir + i,     4);
-        memcpy(&ln,   dir + i + 4, 4);
+    size_t module_count = dir_size / MODULE_RECORD_SIZE;
+    printf("module_count: %zu (%zu bytes / %zu per record, %zu remainder)\n",
+           module_count, (size_t)dir_size, MODULE_RECORD_SIZE,
+           (size_t)dir_size % MODULE_RECORD_SIZE);
 
-        // Does (off, ln) resolve to a /$bunfs/ path? (offsets are section-relative)
-        size_t real = (size_t)off + OFFSET_BIAS;
-        if (off > 0 && real + ln <= bun.size
-            && is_bunfs_path(sec + real, ln, bun.size)) {
+    for (size_t m = 0; m < module_count; ++m) {
+        const uint8_t* rec = dir + m * MODULE_RECORD_SIZE;
 
-            Entry e{};
-            e.dir_offset = i;
-            e.stored_name_off = off;
-            e.name_len = ln;
-            e.name.assign(reinterpret_cast<const char*>(sec + real), ln);
+        uint32_t name_off, name_len, cont_off, cont_len;
+        memcpy(&name_off, rec + 0, 4);
+        memcpy(&name_len, rec + 4, 4);
+        memcpy(&cont_off, rec + 8, 4);
+        memcpy(&cont_len, rec + 12, 4);
 
-            // Look at the following (off, len) — does it point to a content blob?
-            // Accept "// @bun ..." (JS), "\x7fELF" (native .node), or any plausible blob
-            // whose offset/length stay inside the section.
-            e.kind = "name-only";
-            if (i + 16 <= dir_size) {
-                uint32_t coff, clen;
-                memcpy(&coff, dir + i + 8,  4);
-                memcpy(&clen, dir + i + 12, 4);
-                size_t creal = (size_t)coff + OFFSET_BIAS;
-                // Content must physically follow the name in the section
-                // (rejects mis-paired flag bytes being read as a bogus offset).
-                bool follows_name = creal >= real + ln;
-                if (follows_name && coff > 0 && clen >= 4 && creal + clen <= bun.size) {
-                    const uint8_t* cp = sec + creal;
-                    if (clen >= 7 && memcmp(cp, "// @bun", 7) == 0) {
-                        e.kind = "js";
-                        e.has_content = true;
-                    } else if (memcmp(cp, "\x7f""ELF", 4) == 0) {
-                        e.kind = "elf";
-                        e.has_content = true;
-                    } else if (memcmp(cp, "\0asm", 4) == 0) {
-                        e.kind = "wasm";
-                        e.has_content = true;
-                    }
-                    if (e.has_content) {
-                        e.stored_content_off = coff;
-                        e.content_len = clen;
-                    }
-                }
+        // Resolve name - StringPointer.offset is directly into the payload
+        size_t nreal = (size_t)name_off;
+        if (name_off == 0 || nreal + name_len > bun.size) continue;
+        if (!is_bunfs_path(sec + nreal, name_len, bun.size)) continue;
+
+        Entry e{};
+        e.dir_offset = m * MODULE_RECORD_SIZE;
+        e.stored_name_off = name_off;
+        e.name_len = name_len;
+        e.name.assign(reinterpret_cast<const char*>(sec + nreal), name_len);
+
+        // Resolve contents - StringPointer.offset is directly into the blob
+        size_t creal = (size_t)cont_off;
+        if (cont_off > 0 && cont_len >= 4 && creal + cont_len <= bun.size) {
+            const uint8_t* cp = sec + creal;
+            if (cont_len >= 7 && memcmp(cp, "// @bun", 7) == 0) {
+                e.kind = "js";
+                e.has_content = true;
+            } else if (memcmp(cp, "\x7f""ELF", 4) == 0) {
+                e.kind = "elf";
+                e.has_content = true;
+            } else if (memcmp(cp, "\0asm", 4) == 0) {
+                e.kind = "wasm";
+                e.has_content = true;
+            } else {
+                // Unknown content type — extract as raw binary
+                e.kind = "binary";
+                e.has_content = true;
             }
-            entries.push_back(std::move(e));
-            i += e.has_content ? 16 : 8;
-            continue;
+            if (e.has_content) {
+                e.stored_content_off = cont_off;
+                e.content_len = cont_len;
+            }
         }
-        i += 4;
+
+        // Metadata fields (available for future use)
+        // uint8_t encoding = rec[48];
+        // uint8_t loader = rec[49];
+        // uint8_t module_format = rec[50];
+        // uint8_t side = rec[51];
+
+        entries.push_back(std::move(e));
     }
 
     printf("\n%-4s %-50s %-12s %-10s %-12s %-10s %s\n",
@@ -330,23 +355,23 @@ int main(int argc, char** argv) {
     }
 
     printf("\ntotal entries: %zu\n", entries.size());
-    printf("(stored offsets are section-relative; add 8 to dereference)\n");
 
     if (extract) {
         printf("\n--- extracting ---\n");
-        size_t ok = 0, skipped = 0, linked = 0, unsafe = 0;
-
-        // First pass: extract content entries, remember path mapping
-        std::unordered_map<std::string, std::string> extracted; // bunfs name -> output path
+        size_t ok = 0, skipped = 0, unsafe = 0;
         for (const auto& e : entries) {
-            if (!e.has_content) continue;
+            if (!e.has_content) {
+                printf("  %s (no content, skipped)\n", e.name.c_str());
+                ++skipped;
+                continue;
+            }
             std::string full = output_path(e.name, outdir);
             if (!is_safe_relative(full) && full.front() != '/') {
                 fprintf(stderr, "  refusing unsafe path: %s\n", full.c_str());
                 ++unsafe;
                 continue;
             }
-            size_t creal = (size_t)e.stored_content_off + OFFSET_BIAS;
+            size_t creal = (size_t)e.stored_content_off;
             if (strcmp(e.kind, "js") == 0) {
                 // Patch source: replace /$bunfs with outdir inside string literals
                 std::string src(reinterpret_cast<const char*>(sec + creal), e.content_len);
@@ -362,36 +387,10 @@ int main(int argc, char** argv) {
                 printf("  %s (%u bytes, %s)\n",
                        full.c_str(), e.content_len, e.kind);
             }
-            extracted[e.name] = full;
             ++ok;
         }
-
-        // Second pass: handle name-only entries (symlinks for aliases)
-        for (const auto& e : entries) {
-            if (e.has_content) continue;
-            std::string full = output_path(e.name, outdir);
-            auto it = extracted.find(e.name);
-            if (it != extracted.end() && it->second == full) {
-                // Same path as content entry — duplicate, no action needed
-                printf("  %s (name-only, duplicate)\n", full.c_str());
-                ++skipped;
-            } else if (it != extracted.end()) {
-                // Different output path — create symlink
-                mkparents(full);
-                if (symlink(it->second.c_str(), full.c_str()) != 0) {
-                    fprintf(stderr, "  symlink %s -> %s: %s\n",
-                            full.c_str(), it->second.c_str(), strerror(errno));
-                } else {
-                    printf("  %s -> %s (symlink)\n", full.c_str(), it->second.c_str());
-                    ++linked;
-                }
-            } else {
-                printf("  %s (name-only, no content)\n", full.c_str());
-                ++skipped;
-            }
-        }
-        printf("extracted: %zu, symlinked: %zu, skipped (name-only): %zu, refused (unsafe path): %zu\n",
-               ok, linked, skipped, unsafe);
+        printf("extracted: %zu, skipped: %zu, refused (unsafe path): %zu\n",
+               ok, skipped, unsafe);
     }
     return 0;
 }
