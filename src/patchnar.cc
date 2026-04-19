@@ -32,8 +32,6 @@
 
 // Source-highlight: shared tokenization from source_patcher + CharTranslator for path translation
 #include "source_patcher.h"
-#include <srchilite/langmap.h>
-#include <srchilite/languageinfer.h>
 #include <boost/regex.hpp>
 
 // Configuration (compile-time constants from configure)
@@ -49,12 +47,6 @@ static bool debugMode = false;
 static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
 
-
-// Language map for extension -> .lang file lookup (loaded once at startup)
-static srchilite::LangMap langMap(sourceHighlightDataDir, "lang.map");
-
-// Language inferrer for content-based detection (shebang, emacs mode, etc.)
-static srchilite::LanguageInfer languageInfer;
 
 // Hash mappings for inter-package reference substitution
 // Maps old store path basename to new store path basename
@@ -120,8 +112,6 @@ protected:
     }
 };
 
-// Forward declarations
-static std::string detectLanguage(const std::string& content);
 
 // Extensions to skip entirely (don't even call source-highlight)
 // These are documentation, binary, or compressed files that never need patching
@@ -183,47 +173,7 @@ static inline bool shouldSkipByExtension(const std::string& filename)
     return !ext.empty() && SKIP_EXTENSIONS.count(ext) > 0;
 }
 
-// Detect language from content (shebang, emacs mode, xml, etc.)
-// Returns .lang filename (e.g., "sh.lang", "python.lang") or empty string
-static std::string detectLanguage(const std::string& content)
-{
-    // Normalize Nix store paths in shebang for inference
-    // #!/nix/store/xxx-perl-5.42.0/bin/perl → #!/bin/perl
-    // This fixes LanguageInfer extracting hash instead of interpreter name
-    static const boost::regex nixShebangRegex(
-        R"(^(#!\s*)/nix/store/[a-z0-9]+-[^/]+(/bin/\S+))");
-    std::string normalized = boost::regex_replace(content, nixShebangRegex, "$1$2",
-        boost::regex_constants::format_first_only);
 
-    // Content-based detection (shebang, emacs mode, xml, etc.)
-    std::istringstream contentStream(normalized);
-    std::string inferredLang = languageInfer.infer(contentStream);
-
-    if (!inferredLang.empty()) {
-        // Normalize common interpreter variants not in lang.map
-        // e.g., python3 → python, perl5.42.0 → perl
-        static const std::unordered_map<std::string, std::string> langAliases = {
-            {"python3", "python"},
-            {"python2", "python"},
-        };
-        std::string lookupLang = inferredLang;
-        auto aliasIt = langAliases.find(inferredLang);
-        if (aliasIt != langAliases.end()) {
-            lookupLang = aliasIt->second;
-            debug("  normalized '%s' -> '%s'\n", inferredLang.c_str(), lookupLang.c_str());
-        }
-
-        std::string langFile = langMap.getMappedFileName(lookupLang);
-        if (!langFile.empty()) {
-            debug("  detected language from content: %s -> %s\n",
-                  lookupLang.c_str(), langFile.c_str());
-            return langFile;
-        }
-        debug("  inferred language '%s' but no mapping found\n", inferredLang.c_str());
-    }
-
-    return "";
-}
 
 
 // Add a single hash mapping from full store paths
