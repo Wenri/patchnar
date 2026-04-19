@@ -15,6 +15,7 @@
 #include <vector>
 #include <memory>
 #include <cerrno>
+#include <unordered_map>
 
 #include "elf.h"
 #include "patchelf.h"
@@ -333,9 +334,12 @@ int main(int argc, char** argv) {
 
     if (extract) {
         printf("\n--- extracting ---\n");
-        size_t ok = 0, skipped = 0, unsafe = 0;
+        size_t ok = 0, skipped = 0, linked = 0, unsafe = 0;
+
+        // First pass: extract content entries, remember path mapping
+        std::unordered_map<std::string, std::string> extracted; // bunfs name -> output path
         for (const auto& e : entries) {
-            if (!e.has_content) { ++skipped; continue; }
+            if (!e.has_content) continue;
             std::string full = output_path(e.name, outdir);
             if (!is_safe_relative(full) && full.front() != '/') {
                 fprintf(stderr, "  refusing unsafe path: %s\n", full.c_str());
@@ -358,10 +362,36 @@ int main(int argc, char** argv) {
                 printf("  %s (%u bytes, %s)\n",
                        full.c_str(), e.content_len, e.kind);
             }
+            extracted[e.name] = full;
             ++ok;
         }
-        printf("extracted: %zu, skipped (name-only): %zu, refused (unsafe path): %zu\n",
-               ok, skipped, unsafe);
+
+        // Second pass: handle name-only entries (symlinks for aliases)
+        for (const auto& e : entries) {
+            if (e.has_content) continue;
+            std::string full = output_path(e.name, outdir);
+            auto it = extracted.find(e.name);
+            if (it != extracted.end() && it->second == full) {
+                // Same path as content entry — duplicate, no action needed
+                printf("  %s (name-only, duplicate)\n", full.c_str());
+                ++skipped;
+            } else if (it != extracted.end()) {
+                // Different output path — create symlink
+                mkparents(full);
+                if (symlink(it->second.c_str(), full.c_str()) != 0) {
+                    fprintf(stderr, "  symlink %s -> %s: %s\n",
+                            full.c_str(), it->second.c_str(), strerror(errno));
+                } else {
+                    printf("  %s -> %s (symlink)\n", full.c_str(), it->second.c_str());
+                    ++linked;
+                }
+            } else {
+                printf("  %s (name-only, no content)\n", full.c_str());
+                ++skipped;
+            }
+        }
+        printf("extracted: %zu, symlinked: %zu, skipped (name-only): %zu, refused (unsafe path): %zu\n",
+               ok, linked, skipped, unsafe);
     }
     return 0;
 }
