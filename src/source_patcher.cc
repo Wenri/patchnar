@@ -24,6 +24,7 @@
 
 #include <boost/regex.hpp>
 #include <unordered_map>
+#include <algorithm>
 
 const std::string sourceHighlightDataDir = SOURCE_HIGHLIGHT_DATA_DIR;
 
@@ -68,6 +69,36 @@ std::string detectLanguage(const std::string& content)
         }
     }
 
+    return "";
+}
+
+// Get lowercase file extension (e.g., ".html", ".js")
+std::string getExtension(const std::string& filename)
+{
+    size_t dot = filename.rfind('.');
+    if (dot == std::string::npos || dot == 0) {
+        return "";
+    }
+    std::string ext = filename.substr(dot);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext;
+}
+
+// Detect language from filename extension with content fallback.
+std::string detectLanguageFromFile(
+    const std::string& filename,
+    const std::string& content,
+    size_t maxContentDetect)
+{
+    // Try extension-based lookup first
+    std::string langFile = langMap.getMappedFileNameFromFileName(filename);
+    if (!langFile.empty()) {
+        return langFile;
+    }
+    // Fall back to content-based detection (shebang, emacs mode, etc.)
+    if (maxContentDetect > 0 && content.size() <= maxContentDetect) {
+        return detectLanguage(content);
+    }
     return "";
 }
 

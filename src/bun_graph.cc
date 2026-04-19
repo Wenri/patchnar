@@ -344,10 +344,12 @@ int main(int argc, char** argv) {
             }
             size_t creal = (size_t)e.stored_content_off + OFFSET_BIAS;
             if (strcmp(e.kind, "js") == 0) {
-                // Patch JS: replace /$bunfs with outdir inside string literals
+                // Patch source: replace /$bunfs with outdir inside string literals
                 std::string src(reinterpret_cast<const char*>(sec + creal), e.content_len);
+                std::string langFile = detectLanguageFromFile(full, src);
+                if (langFile.empty()) langFile = "javascript.lang"; // fallback for JS
                 BunfsTranslator translator(outdir);
-                std::string patched = patchSourceStrings(src, "javascript.lang", translator);
+                std::string patched = patchSourceStrings(src, langFile, translator);
                 if (!write_file(full, patched)) return 1;
                 printf("  %s (%zu bytes, %s, patched)\n",
                        full.c_str(), patched.size(), e.kind);

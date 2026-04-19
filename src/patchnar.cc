@@ -130,9 +130,7 @@ static const std::unordered_set<std::string> SKIP_EXTENSIONS = {
     ".haddock", ".hi", ".o", ".a", ".so", ".dylib",
 };
 
-// Maximum file size for content-based language detection (shebang parsing)
-// Scripts needing patching are typically small; large extensionless files are data/binary
-static constexpr size_t MAX_CONTENT_DETECT_SIZE = 64 * 1024;  // 64KB
+
 
 
 // Whitelist of language files worth tokenizing for string literal patching
@@ -151,19 +149,6 @@ static void debug(const char* format, ...)
         vfprintf(stderr, format, ap);
         va_end(ap);
     }
-}
-
-// Get lowercase file extension (e.g., ".html", ".png")
-static inline std::string getExtension(const std::string& filename)
-{
-    size_t dot = filename.rfind('.');
-    if (dot == std::string::npos || dot == 0) {
-        return "";
-    }
-    std::string ext = filename.substr(dot);
-    // Convert to lowercase
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    return ext;
 }
 
 // Check if file should be skipped based on extension (non-patchable files)
@@ -537,11 +522,8 @@ static std::vector<std::byte> patchContent(
     }
 
     // === LANGUAGE DETECTION ===
-    std::string langFile = langMap.getMappedFileNameFromFileName(filename);
-    if (langFile.empty() && content.size() <= MAX_CONTENT_DETECT_SIZE) {
-        std::string str(reinterpret_cast<const char*>(content.data()), content.size());
-        langFile = detectLanguage(str);
-    }
+    std::string str(reinterpret_cast<const char*>(content.data()), content.size());
+    std::string langFile = detectLanguageFromFile(filename, str);
 
     // === SOURCE PATCHING (strings + comments including shebangs) ===
     std::vector<std::byte> result;
