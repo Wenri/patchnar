@@ -87,8 +87,19 @@ struct Entry {
     uint32_t name_len;
     uint32_t stored_content_off;
     uint32_t content_len;
+    uint32_t stored_bytecode_off;  // JSC bytecode offset (bytes 24-27)
+    uint32_t bytecode_len;         // JSC bytecode length (bytes 28-31)
+    uint32_t stored_sourcemap_off;
+    uint32_t sourcemap_len;
     std::string name;
+    std::string module_info;
+    std::string bytecode_origin_path;
     bool has_content;
+    bool has_bytecode;
+    uint8_t encoding;
+    uint8_t loader;
+    uint8_t module_format;
+    uint8_t side;
     const char* kind;         // short label describing detected content type
 };
 
@@ -293,10 +304,20 @@ int main(int argc, char** argv) {
         const uint8_t* rec = dir + m * MODULE_RECORD_SIZE;
 
         uint32_t name_off, name_len, cont_off, cont_len;
+        uint32_t sm_off, sm_len, bc_off, bc_len;
+        uint32_t mi_off, mi_len, bcop_off, bcop_len;
         memcpy(&name_off, rec + 0, 4);
         memcpy(&name_len, rec + 4, 4);
         memcpy(&cont_off, rec + 8, 4);
         memcpy(&cont_len, rec + 12, 4);
+        memcpy(&sm_off,   rec + 16, 4);
+        memcpy(&sm_len,   rec + 20, 4);
+        memcpy(&bc_off,   rec + 24, 4);
+        memcpy(&bc_len,   rec + 28, 4);
+        memcpy(&mi_off,   rec + 32, 4);
+        memcpy(&mi_len,   rec + 36, 4);
+        memcpy(&bcop_off, rec + 40, 4);
+        memcpy(&bcop_len, rec + 44, 4);
 
         // Resolve name - StringPointer.offset is directly into the payload
         size_t nreal = (size_t)name_off;
@@ -333,34 +354,85 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Metadata fields (available for future use)
-        // uint8_t encoding = rec[48];
-        // uint8_t loader = rec[49];
-        // uint8_t module_format = rec[50];
-        // uint8_t side = rec[51];
+        // Resolve bytecode - StringPointer at bytes 24-31 (JSC pre-compiled bytecode)
+        size_t bcreal = (size_t)bc_off;
+        if (bc_off > 0 && bc_len > 0 && bcreal + bc_len <= bun.size) {
+            e.has_bytecode = true;
+            e.stored_bytecode_off = bc_off;
+            e.bytecode_len = bc_len;
+        }
+
+        // Resolve remaining StringPointers
+        if (sm_off > 0 && sm_len > 0 && (size_t)sm_off + sm_len <= bun.size) {
+            e.stored_sourcemap_off = sm_off;
+            e.sourcemap_len = sm_len;
+        }
+        if (mi_off > 0 && mi_len > 0 && (size_t)mi_off + mi_len <= bun.size)
+            e.module_info.assign(reinterpret_cast<const char*>(sec + mi_off), mi_len);
+        if (bcop_off > 0 && bcop_len > 0 && (size_t)bcop_off + bcop_len <= bun.size)
+            e.bytecode_origin_path.assign(reinterpret_cast<const char*>(sec + bcop_off), bcop_len);
+
+        // Metadata byte fields
+        e.encoding = rec[48];
+        e.loader = rec[49];
+        e.module_format = rec[50];
+        e.side = rec[51];
 
         entries.push_back(std::move(e));
     }
 
-    printf("\n%-4s %-50s %-12s %-10s %-12s %-10s %s\n",
-           "idx", "path", "name_off", "name_len", "content_off", "content_len", "kind");
+    printf("\n%-4s %-50s %-12s %-10s %-12s %-10s %-12s %-10s %s\n",
+           "idx", "path", "name_off", "name_len", "content_off", "content_len",
+           "bc_off", "bc_len", "kind");
     for (size_t k = 0; k < entries.size(); ++k) {
         const auto& e = entries[k];
         std::string path = output_path(e.name, outdir);
-        printf("%-4zu %-50s 0x%010x %-10u 0x%010x %-10u %s\n",
+        printf("%-4zu %-50s 0x%010x %-10u 0x%010x %-10u",
                k, path.c_str(),
                e.stored_name_off, e.name_len,
-               e.stored_content_off, e.content_len,
-               e.kind);
+               e.stored_content_off, e.content_len);
+        if (e.has_bytecode)
+            printf(" 0x%010x %-10u", e.stored_bytecode_off, e.bytecode_len);
+        else
+            printf(" %-12s %-10s", "-", "-");
+        printf(" %s%s\n", e.kind, e.has_bytecode ? "+jsc" : "");
     }
 
-    printf("\ntotal entries: %zu\n", entries.size());
+    size_t bc_count = 0;
+    for (const auto& e : entries) if (e.has_bytecode) ++bc_count;
+    printf("\ntotal entries: %zu (%zu with JSC bytecode)\n", entries.size(), bc_count);
+
+    // Per-entry detail block with all StringPointer fields
+    static const char* loader_names[] = {
+        "jsx", "js", "ts", "tsx", "css", "file", "json", "toml", "wasm", "napi", "base64", "dataurl", "text", "sqlite", "sqlite_embedded"
+    };
+    static const char* module_format_names[] = { "esm", "cjs", "none" };
+    static const char* side_names[] = { "client", "server", "none" };
+    printf("\n--- entry details ---\n");
+    for (size_t k = 0; k < entries.size(); ++k) {
+        const auto& e = entries[k];
+        std::string path = output_path(e.name, outdir);
+        printf("\n[%zu] %s\n", k, path.c_str());
+        printf("  encoding:             %u\n", e.encoding);
+        printf("  loader:               %u (%s)\n", e.loader,
+               e.loader < sizeof(loader_names)/sizeof(loader_names[0]) ? loader_names[e.loader] : "?");
+        printf("  module_format:        %u (%s)\n", e.module_format,
+               e.module_format < sizeof(module_format_names)/sizeof(module_format_names[0]) ? module_format_names[e.module_format] : "?");
+        printf("  side:                 %u (%s)\n", e.side,
+               e.side < sizeof(side_names)/sizeof(side_names[0]) ? side_names[e.side] : "?");
+        if (e.sourcemap_len > 0)
+            printf("  sourcemap:            %u bytes (off=0x%08x)\n", e.sourcemap_len, e.stored_sourcemap_off);
+        if (!e.module_info.empty())
+            printf("  module_info:          %.*s\n", (int)std::min(e.module_info.size(), (size_t)200), e.module_info.c_str());
+        if (!e.bytecode_origin_path.empty())
+            printf("  bytecode_origin_path: %s\n", e.bytecode_origin_path.c_str());
+    }
 
     if (extract) {
         printf("\n--- extracting ---\n");
-        size_t ok = 0, skipped = 0, unsafe = 0;
+        size_t ok = 0, skipped = 0, unsafe = 0, jsc_ok = 0;
         for (const auto& e : entries) {
-            if (!e.has_content) {
+            if (!e.has_content && !e.has_bytecode) {
                 printf("  %s (no content, skipped)\n", e.name.c_str());
                 ++skipped;
                 continue;
@@ -371,26 +443,38 @@ int main(int argc, char** argv) {
                 ++unsafe;
                 continue;
             }
-            size_t creal = (size_t)e.stored_content_off;
-            if (strcmp(e.kind, "js") == 0) {
-                // Patch source: replace /$bunfs with outdir inside string literals
-                std::string src(reinterpret_cast<const char*>(sec + creal), e.content_len);
-                std::string langFile = detectLanguageFromFile(full, src);
-                if (langFile.empty()) langFile = "javascript.lang"; // fallback for JS
-                BunfsTranslator translator(outdir);
-                std::string patched = patchSourceStrings(src, langFile, translator);
-                if (!write_file(full, patched)) return 1;
-                printf("  %s (%zu bytes, %s, patched)\n",
-                       full.c_str(), patched.size(), e.kind);
-            } else {
-                if (!write_file(full, sec + creal, e.content_len)) return 1;
-                printf("  %s (%u bytes, %s)\n",
-                       full.c_str(), e.content_len, e.kind);
+            // Extract JS/binary content
+            if (e.has_content) {
+                size_t creal = (size_t)e.stored_content_off;
+                if (strcmp(e.kind, "js") == 0) {
+                    // Patch source: replace /$bunfs with outdir inside string literals
+                    std::string src(reinterpret_cast<const char*>(sec + creal), e.content_len);
+                    std::string langFile = detectLanguageFromFile(full, src);
+                    if (langFile.empty()) langFile = "javascript.lang"; // fallback for JS
+                    BunfsTranslator translator(outdir);
+                    std::string patched = patchSourceStrings(src, langFile, translator);
+                    if (!write_file(full, patched)) return 1;
+                    printf("  %s (%zu bytes, %s, patched)\n",
+                           full.c_str(), patched.size(), e.kind);
+                } else {
+                    if (!write_file(full, sec + creal, e.content_len)) return 1;
+                    printf("  %s (%u bytes, %s)\n",
+                           full.c_str(), e.content_len, e.kind);
+                }
+                ++ok;
             }
-            ++ok;
+            // Extract JSC bytecode as sibling .jsc file
+            if (e.has_bytecode) {
+                std::string jsc_path = full + ".jsc";
+                size_t bcreal = (size_t)e.stored_bytecode_off;
+                if (!write_file(jsc_path, sec + bcreal, e.bytecode_len)) return 1;
+                printf("  %s (%u bytes, jsc bytecode)\n",
+                       jsc_path.c_str(), e.bytecode_len);
+                ++jsc_ok;
+            }
         }
-        printf("extracted: %zu, skipped: %zu, refused (unsafe path): %zu\n",
-               ok, skipped, unsafe);
+        printf("extracted: %zu source + %zu jsc, skipped: %zu, refused (unsafe path): %zu\n",
+               ok, jsc_ok, skipped, unsafe);
     }
     return 0;
 }
