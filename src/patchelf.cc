@@ -2227,8 +2227,9 @@ void ElfFile<ElfFileParamNames>::addDebugTag()
    patch in Nixpkgs that reads it; keep them in sync. The descriptor is a
    sequence of NUL-terminated (needed, path-list) string pairs, where each
    path-list entry is "=<absolute-path>" for a directly resolved library or
-   "?<dir>" for a directory the loader must still search itself (used for
-   $ORIGIN-style and glibc-hwcaps directories). */
+   "?<dir>" for a directory the loader must still search itself (dynamic
+   string tokens, glibc-hwcaps directories, and components that only
+   resolve or exist at run time). */
 static const char ldCacheNoteName[] = "NixOS";
 static const char ldCacheSectionName[] = ".note.nixos.ldcache";
 static constexpr uint32_t NT_NIXOS_LD_CACHE = 0x63a86cb6;
@@ -2346,7 +2347,8 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
 
     /* Resolve each soname against the run path, first match wins (as the
        loader does). Components that only resolve at run time are recorded as a
-       search hint for the loader instead of an exact path (see loop below). */
+       search hint for the loader instead of an exact path (see
+       needsSearchHint below). */
     std::map<std::string, std::string> cache;
     auto addEntry = [&](const std::string & lib, const std::string & resolved) {
         auto & entry = cache[lib];
@@ -2360,18 +2362,28 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
     const auto isSearched = [](const std::string & lib) {
         return lib.find('/') == std::string::npos;
     };
-    for (const auto & dir : runPath) {
+    /* A component gets a search hint when it can't be exhaustively searched
+       at patch time. Hints keep their run-path position, so a later exact
+       entry can't bypass an earlier search position. */
+    const auto needsSearchHint = [](const std::string & dir) {
         /* An empty or relative component resolves against the process's
-           current directory at run time, so it can't be baked into an exact
-           path here. Dynamic-string tokens and glibc-hwcaps directories
-           likewise must be probed by the loader. All are recorded as a search
-           hint in run-path order, so a later exact entry can't bypass this
-           earlier search position. */
-        const bool runtimeOnly = dir.empty() || dir[0] != '/';
-        const bool hasToken = !runtimeOnly && dir.find('$') != std::string::npos;
-        const bool hasHwcaps = !runtimeOnly && !hasToken
-            && access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
-        if (runtimeOnly || hasToken || hasHwcaps) {
+           current directory at run time. */
+        if (dir.empty() || dir[0] != '/')
+            return true;
+        /* Dynamic-string tokens like $ORIGIN are expanded by the loader. */
+        if (dir.find('$') != std::string::npos)
+            return true;
+        /* An absolute directory absent at patch time may be populated at run
+           time (e.g. /run/opengl-driver/lib on NixOS, which never exists
+           inside the build sandbox). */
+        if (access(dir.c_str(), F_OK) != 0)
+            return true;
+        /* A glibc-hwcaps subdirectory makes the loader probe
+           hardware-specific paths under this directory. */
+        return access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
+    };
+    for (const auto & dir : runPath) {
+        if (needsSearchHint(dir)) {
             const std::string hint = "?" + dir;
             for (const auto & lib : needed)
                 if (isSearched(lib))
