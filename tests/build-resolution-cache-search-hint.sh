@@ -84,4 +84,12 @@ make_cached "${SCRATCH}/main-missing" "${here}/${SCRATCH}/does-not-exist:${libs}
 expect_entry "?${here}/${SCRATCH}/does-not-exist:=${libs}/libfoo.so" \
     "missing run-path directory was not recorded as a '?' hint before the exact entry"
 
+# A trailing empty run-path component ("libs:") is a CWD search position at
+# the end of the search order, just like a leading one; it must be preserved
+# as a trailing bare "?" hint after the exact entry, not silently dropped by
+# the run-path splitter.
+make_cached "${SCRATCH}/main-cwd-trailing" "${libs}:"
+expect_entry "=${libs}/libfoo.so:?" \
+    "trailing empty run-path component was not recorded as a trailing '?' hint"
+
 echo "PASS"

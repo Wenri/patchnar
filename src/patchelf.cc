@@ -78,7 +78,10 @@ static int forcedPageSize = -1;
 #define EM_LOONGARCH    258
 #endif
 
-[[nodiscard]] static std::vector<std::string> splitColonDelimitedString(std::string_view s)
+/* Leading and middle empty components are always kept; a trailing one is
+   dropped unless keepTrailingEmpty is set (run-path semantics read a
+   trailing ':' as a final current-directory search position). */
+[[nodiscard]] static std::vector<std::string> splitColonDelimitedString(std::string_view s, bool keepTrailingEmpty = false)
 {
     std::vector<std::string> parts;
 
@@ -88,7 +91,7 @@ static int forcedPageSize = -1;
         s = s.substr(pos + 1);
     }
 
-    if (!s.empty())
+    if (keepTrailingEmpty || !s.empty())
         parts.emplace_back(s);
 
     return parts;
@@ -2337,8 +2340,11 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
     }
     /* DT_RUNPATH takes precedence over DT_RPATH, as in the loader. */
     const char * runPathStr = dtRunPath ? dtRunPath : dtRPath;
-    std::vector<std::string> runPath =
-        runPathStr ? splitColonDelimitedString(runPathStr) : std::vector<std::string>{};
+    /* Trailing empty components are search positions like any other; an
+       entirely empty run-path string still means no search path. */
+    std::vector<std::string> runPath = runPathStr && *runPathStr
+        ? splitColonDelimitedString(runPathStr, /* keepTrailingEmpty */ true)
+        : std::vector<std::string>{};
     if (needed.empty() || runPath.empty()) {
         failIfStale();
         fprintf(stderr, "warning: --build-resolution-cache: no DT_NEEDED entries or run path to resolve; no cache written\n");
