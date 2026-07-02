@@ -108,9 +108,10 @@ and records the result in a \fB.note.nixos.ldcache\fR note, so that a loader
 which understands the note can skip the run-path search at startup. Directories
 that cannot be resolved ahead of time (empty or relative components, those
 containing dynamic-string tokens such as \fB$ORIGIN\fR or a \fBglibc-hwcaps\fR
-subdirectory, and directories that do not exist at patch time) are stored as a
-search hint instead of an exact path. The cache is built once from an unpatched
-binary; this option cannot be combined with \fB--force-rpath\fR.
+subdirectory, and paths that cannot be searched at patch time because they are
+missing, not a directory, or not accessible) are stored as a search hint
+instead of an exact path. The cache is built once from an unpatched binary;
+this option cannot be combined with \fB--force-rpath\fR.
 
 .IP "--no-sort"
 Do not sort program headers or section headers.  This is useful when

@@ -2379,10 +2379,13 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
         /* Dynamic-string tokens like $ORIGIN are expanded by the loader. */
         if (dir.find('$') != std::string::npos)
             return true;
-        /* An absolute directory absent at patch time may be populated at run
+        /* An absolute path that is missing, a non-directory placeholder, or
+           without search permission may be populated or accessible at run
            time (e.g. /run/opengl-driver/lib on NixOS, which never exists
            inside the build sandbox). */
-        if (access(dir.c_str(), F_OK) != 0)
+        struct stat st;
+        if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)
+            || access(dir.c_str(), X_OK) != 0)
             return true;
         /* A glibc-hwcaps subdirectory makes the loader probe
            hardware-specific paths under this directory. */

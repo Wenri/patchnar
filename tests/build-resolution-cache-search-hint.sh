@@ -92,4 +92,25 @@ make_cached "${SCRATCH}/main-cwd-trailing" "${libs}:"
 expect_entry "=${libs}/libfoo.so:?" \
     "trailing empty run-path component was not recorded as a trailing '?' hint"
 
+# A run-path entry that exists as a plain file is not a searchable directory;
+# like a missing directory, it may be a placeholder that becomes a populated
+# directory at run time, so it must keep its search position as a "?" hint
+# instead of being silently dropped.
+touch "${SCRATCH}/not-a-dir"
+make_cached "${SCRATCH}/main-notdir" "${here}/${SCRATCH}/not-a-dir:${libs}"
+expect_entry "?${here}/${SCRATCH}/not-a-dir:=${libs}/libfoo.so" \
+    "plain-file run-path entry was not recorded as a '?' hint before the exact entry"
+
+# A directory that exists but cannot be searched by the patching user may be
+# readable at run time; its position must also be kept as a "?" hint. Root
+# ignores directory permissions, so the probe behaves differently there.
+if [ "$(id -u)" != 0 ]; then
+    mkdir -p "${SCRATCH}/no-access"
+    chmod 000 "${SCRATCH}/no-access"
+    make_cached "${SCRATCH}/main-noaccess" "${here}/${SCRATCH}/no-access:${libs}"
+    chmod 700 "${SCRATCH}/no-access"
+    expect_entry "?${here}/${SCRATCH}/no-access:=${libs}/libfoo.so" \
+        "unsearchable run-path directory was not recorded as a '?' hint before the exact entry"
+fi
+
 echo "PASS"
