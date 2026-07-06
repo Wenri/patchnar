@@ -78,7 +78,9 @@ static int forcedPageSize = -1;
 #define EM_LOONGARCH    258
 #endif
 
-[[nodiscard]] static std::vector<std::string> splitColonDelimitedString(std::string_view s)
+/* A trailing ':' is a final current-directory search position under run-path
+   semantics, kept only when keepTrailingEmpty is set. */
+[[nodiscard]] static std::vector<std::string> splitColonDelimitedString(std::string_view s, bool keepTrailingEmpty = false)
 {
     std::vector<std::string> parts;
 
@@ -88,7 +90,7 @@ static int forcedPageSize = -1;
         s = s.substr(pos + 1);
     }
 
-    if (!s.empty())
+    if (keepTrailingEmpty || !s.empty())
         parts.emplace_back(s);
 
     return parts;
@@ -2227,11 +2229,29 @@ void ElfFile<ElfFileParamNames>::addDebugTag()
    patch in Nixpkgs that reads it; keep them in sync. The descriptor is a
    sequence of NUL-terminated (needed, path-list) string pairs, where each
    path-list entry is "=<absolute-path>" for a directly resolved library or
-   "?<dir>" for a directory the loader must still search itself (used for
-   $ORIGIN-style and glibc-hwcaps directories). */
+   "?<dir>" for a directory the loader must still search itself. */
 static const char ldCacheNoteName[] = "NixOS";
 static const char ldCacheSectionName[] = ".note.nixos.ldcache";
 static constexpr uint32_t NT_NIXOS_LD_CACHE = 0x63a86cb6;
+
+/* A run-path component that can't be exhaustively searched at patch time gets
+   a hint keeping its run-path position, so a later exact entry can't bypass
+   it. This covers empty/relative components and dynamic-string tokens the
+   loader expands, absolute paths that are missing or unsearchable at patch
+   time but may appear at run time (e.g. /run/opengl-driver/lib on NixOS), and
+   glibc-hwcaps directories the loader probes for. */
+[[nodiscard]] static bool needsSearchHint(const std::string & dir)
+{
+    if (dir.empty() || dir[0] != '/')
+        return true;
+    if (dir.find('$') != std::string::npos)
+        return true;
+    struct stat st;
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)
+        || access(dir.c_str(), X_OK) != 0)
+        return true;
+    return access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
+}
 
 template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::removeResolutionCache()
@@ -2336,8 +2356,10 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
     }
     /* DT_RUNPATH takes precedence over DT_RPATH, as in the loader. */
     const char * runPathStr = dtRunPath ? dtRunPath : dtRPath;
-    std::vector<std::string> runPath =
-        runPathStr ? splitColonDelimitedString(runPathStr) : std::vector<std::string>{};
+    /* Keep a trailing empty component; an empty run-path string has none. */
+    std::vector<std::string> runPath = runPathStr && *runPathStr
+        ? splitColonDelimitedString(runPathStr, /* keepTrailingEmpty */ true)
+        : std::vector<std::string>{};
     if (needed.empty() || runPath.empty()) {
         failIfStale();
         fprintf(stderr, "warning: --build-resolution-cache: no DT_NEEDED entries or run path to resolve; no cache written\n");
@@ -2346,7 +2368,7 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
 
     /* Resolve each soname against the run path, first match wins (as the
        loader does). Components that only resolve at run time are recorded as a
-       search hint for the loader instead of an exact path (see loop below). */
+       search hint instead of an exact path. */
     std::map<std::string, std::string> cache;
     auto addEntry = [&](const std::string & lib, const std::string & resolved) {
         auto & entry = cache[lib];
@@ -2361,17 +2383,7 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
         return lib.find('/') == std::string::npos;
     };
     for (const auto & dir : runPath) {
-        /* An empty or relative component resolves against the process's
-           current directory at run time, so it can't be baked into an exact
-           path here. Dynamic-string tokens and glibc-hwcaps directories
-           likewise must be probed by the loader. All are recorded as a search
-           hint in run-path order, so a later exact entry can't bypass this
-           earlier search position. */
-        const bool runtimeOnly = dir.empty() || dir[0] != '/';
-        const bool hasToken = !runtimeOnly && dir.find('$') != std::string::npos;
-        const bool hasHwcaps = !runtimeOnly && !hasToken
-            && access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
-        if (runtimeOnly || hasToken || hasHwcaps) {
+        if (needsSearchHint(dir)) {
             const std::string hint = "?" + dir;
             for (const auto & lib : needed)
                 if (isSearched(lib))

@@ -1,7 +1,8 @@
 #! /bin/sh -e
 # Run-path entries that can't be resolved at patch time -- dynamic-string
-# tokens ($ORIGIN/$LIB/$PLATFORM) and glibc-hwcaps directories -- must be
-# recorded as "?<dir>" search hints, never as absolute "=<path>" entries.
+# tokens ($ORIGIN/$LIB/$PLATFORM), glibc-hwcaps directories, and components
+# that only resolve or exist at run time -- must be recorded as "?<dir>"
+# search hints, never as absolute "=<path>" entries.
 SCRATCH=scratch/$(basename "$0" .sh)
 READELF=${READELF:-readelf}
 PATCHELF=$(readlink -f "../src/patchelf")
@@ -11,77 +12,93 @@ mkdir -p "${SCRATCH}/libs"
 
 cp libfoo.so "${SCRATCH}/libs/"
 
+here=$(pwd)
+libs="${here}/${SCRATCH}/libs"
+
 descriptor() {
     ${READELF} -p .note.nixos.ldcache "$1"
 }
 
-cp main "${SCRATCH}/main-origin"
+# Sets the run path on a fresh copy of main, builds the cache, and leaves the
+# descriptor dump in $d for the expect_* helpers.
+make_cached() {
+    cp main "$1"
+    ${PATCHELF} --set-rpath "$2" "$1"
+    ${PATCHELF} --build-resolution-cache "$1"
+    d=$(descriptor "$1")
+    echo "$d"
+}
+
+expect_entry() {
+    if ! echo "$d" | grep -qF "$1"; then
+        echo "FAIL: $2"
+        exit 1
+    fi
+}
+
+expect_no_entry() {
+    if echo "$d" | grep -qF "$1"; then
+        echo "FAIL: $2"
+        exit 1
+    fi
+}
+
 # $ORIGIN is a literal loader token; it must reach patchelf unexpanded.
 # shellcheck disable=SC2016
-${PATCHELF} --set-rpath '$ORIGIN/libs' "${SCRATCH}/main-origin"
-${PATCHELF} --build-resolution-cache "${SCRATCH}/main-origin"
-
-d=$(descriptor "${SCRATCH}/main-origin")
-echo "$d"
+make_cached "${SCRATCH}/main-origin" '$ORIGIN/libs'
 # shellcheck disable=SC2016
-if ! echo "$d" | grep -qF '?$ORIGIN/libs'; then
-    echo "FAIL: \$ORIGIN run path was not recorded as a '?' search hint"
-    exit 1
-fi
+expect_entry '?$ORIGIN/libs' "\$ORIGIN run path was not recorded as a '?' search hint"
 # shellcheck disable=SC2016
-if echo "$d" | grep -qF '=$ORIGIN/libs'; then
-    echo "FAIL: \$ORIGIN run path was wrongly baked into an absolute '=' path"
-    exit 1
-fi
+expect_no_entry '=$ORIGIN/libs' "\$ORIGIN run path was wrongly baked into an absolute '=' path"
 
-# libfoo.so is present here, so without the hwcaps guard it would resolve to an
-# absolute "=path"; the guard must force a "?" hint regardless.
+# libfoo.so is present here, so the hwcaps guard must force a "?" hint anyway.
 mkdir -p "${SCRATCH}/hw/glibc-hwcaps"
 cp libfoo.so "${SCRATCH}/hw/"
-cp main "${SCRATCH}/main-hwcaps"
-${PATCHELF} --set-rpath "$(pwd)/${SCRATCH}/hw" "${SCRATCH}/main-hwcaps"
-${PATCHELF} --build-resolution-cache "${SCRATCH}/main-hwcaps"
+make_cached "${SCRATCH}/main-hwcaps" "${here}/${SCRATCH}/hw"
+expect_entry "?${here}/${SCRATCH}/hw" \
+    "glibc-hwcaps directory was not recorded as a '?' search hint"
+expect_no_entry "=${here}/${SCRATCH}/hw/libfoo.so" \
+    "library under a glibc-hwcaps dir was wrongly resolved to a path"
 
-d=$(descriptor "${SCRATCH}/main-hwcaps")
-echo "$d"
-if ! echo "$d" | grep -qF "?$(pwd)/${SCRATCH}/hw"; then
-    echo "FAIL: glibc-hwcaps directory was not recorded as a '?' search hint"
-    exit 1
-fi
-if echo "$d" | grep -qF "=$(pwd)/${SCRATCH}/hw/libfoo.so"; then
-    echo "FAIL: library under a glibc-hwcaps dir was wrongly resolved to a path"
-    exit 1
-fi
+# An empty component is the run-time current directory: a bare "?" hint.
+make_cached "${SCRATCH}/main-cwd" ":${libs}"
+expect_entry "?:=${libs}/libfoo.so" \
+    "empty run-path component was not recorded as a '?' hint before the exact entry"
 
-# An empty run-path component (the caller's current directory at run time)
-# only resolves at run time; it must become a bare "?" hint, kept in run-path
-# order, so the later exact libs entry cannot bypass that search position.
-cp main "${SCRATCH}/main-cwd"
-${PATCHELF} --set-rpath ":$(pwd)/${SCRATCH}/libs" "${SCRATCH}/main-cwd"
-${PATCHELF} --build-resolution-cache "${SCRATCH}/main-cwd"
+# A relative component must not be baked in against patchelf's own cwd.
+make_cached "${SCRATCH}/main-rel" "relative/dir:${libs}"
+expect_entry "?relative/dir:=${libs}/libfoo.so" \
+    "relative run-path component was not recorded as a '?' search hint"
+expect_no_entry "=relative/dir/libfoo.so" \
+    "relative run-path component was wrongly baked into an '=' path"
 
-d=$(descriptor "${SCRATCH}/main-cwd")
-echo "$d"
-if ! echo "$d" | grep -qF "?:=$(pwd)/${SCRATCH}/libs/libfoo.so"; then
-    echo "FAIL: empty run-path component was not recorded as a '?' hint before the exact entry"
-    exit 1
-fi
+# An absent directory may be populated at run time (e.g. /run/opengl-driver/lib
+# in a build sandbox): keep it as a "?" hint.
+make_cached "${SCRATCH}/main-missing" "${here}/${SCRATCH}/does-not-exist:${libs}"
+expect_entry "?${here}/${SCRATCH}/does-not-exist:=${libs}/libfoo.so" \
+    "missing run-path directory was not recorded as a '?' hint before the exact entry"
 
-# A relative component would otherwise be probed against patchelf's own
-# working directory and could be baked in as a bogus relative "=" path.
-cp main "${SCRATCH}/main-rel"
-${PATCHELF} --set-rpath "relative/dir:$(pwd)/${SCRATCH}/libs" "${SCRATCH}/main-rel"
-${PATCHELF} --build-resolution-cache "${SCRATCH}/main-rel"
+# A trailing empty component ("libs:") is a final CWD search position: kept as
+# a trailing "?" hint, not dropped by the splitter.
+make_cached "${SCRATCH}/main-cwd-trailing" "${libs}:"
+expect_entry "=${libs}/libfoo.so:?" \
+    "trailing empty run-path component was not recorded as a trailing '?' hint"
 
-d=$(descriptor "${SCRATCH}/main-rel")
-echo "$d"
-if ! echo "$d" | grep -qF "?relative/dir:=$(pwd)/${SCRATCH}/libs/libfoo.so"; then
-    echo "FAIL: relative run-path component was not recorded as a '?' search hint"
-    exit 1
-fi
-if echo "$d" | grep -qF "=relative/dir/libfoo.so"; then
-    echo "FAIL: relative run-path component was wrongly baked into an '=' path"
-    exit 1
+# A plain-file entry is not a searchable directory; keep it as a "?" hint.
+touch "${SCRATCH}/not-a-dir"
+make_cached "${SCRATCH}/main-notdir" "${here}/${SCRATCH}/not-a-dir:${libs}"
+expect_entry "?${here}/${SCRATCH}/not-a-dir:=${libs}/libfoo.so" \
+    "plain-file run-path entry was not recorded as a '?' hint before the exact entry"
+
+# A directory unsearchable by the patching user may be readable at run time:
+# keep it as a "?" hint. Skip as root, which ignores directory permissions.
+if [ "$(id -u)" != 0 ]; then
+    mkdir -p "${SCRATCH}/no-access"
+    chmod 000 "${SCRATCH}/no-access"
+    make_cached "${SCRATCH}/main-noaccess" "${here}/${SCRATCH}/no-access:${libs}"
+    chmod 700 "${SCRATCH}/no-access"
+    expect_entry "?${here}/${SCRATCH}/no-access:=${libs}/libfoo.so" \
+        "unsearchable run-path directory was not recorded as a '?' hint before the exact entry"
 fi
 
 echo "PASS"
