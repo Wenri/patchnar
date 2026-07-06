@@ -1,5 +1,19 @@
 # Release History
 
+## 0.19.1 (July 6, 2026)
+
+A small bug fix release for `--build-resolution-cache`.
+
+### Bug fixes
+
+* `--build-resolution-cache`: run-path entries that only resolve at run time are
+  now recorded as search hints in run-path order instead of being dropped or
+  baked in as bogus exact entries, so cached resolution keeps the semantics of a
+  plain run-path walk (#658, #659). This covers empty and relative components,
+  absolute directories absent at patch time (such as `/run/opengl-driver/lib`
+  on NixOS), trailing empty components, and entries that exist but are not
+  searchable directories when patching.
+
 ## 0.19.0 (June 26, 2026)
 
 This is the first feature release since 0.18.0 (April 2023) and collects three
