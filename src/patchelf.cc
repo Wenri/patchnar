@@ -2234,6 +2234,25 @@ static const char ldCacheNoteName[] = "NixOS";
 static const char ldCacheSectionName[] = ".note.nixos.ldcache";
 static constexpr uint32_t NT_NIXOS_LD_CACHE = 0x63a86cb6;
 
+/* A run-path component that can't be exhaustively searched at patch time gets
+   a hint keeping its run-path position, so a later exact entry can't bypass
+   it. This covers empty/relative components and dynamic-string tokens the
+   loader expands, absolute paths that are missing or unsearchable at patch
+   time but may appear at run time (e.g. /run/opengl-driver/lib on NixOS), and
+   glibc-hwcaps directories the loader probes for. */
+[[nodiscard]] static bool needsSearchHint(const std::string & dir)
+{
+    if (dir.empty() || dir[0] != '/')
+        return true;
+    if (dir.find('$') != std::string::npos)
+        return true;
+    struct stat st;
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)
+        || access(dir.c_str(), X_OK) != 0)
+        return true;
+    return access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
+}
+
 template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::removeResolutionCache()
 {
@@ -2362,23 +2381,6 @@ void ElfFile<ElfFileParamNames>::buildResolutionCache()
        here. */
     const auto isSearched = [](const std::string & lib) {
         return lib.find('/') == std::string::npos;
-    };
-    /* A component that can't be exhaustively searched at patch time gets a
-       hint keeping its run-path position, so a later exact entry can't bypass
-       it. This covers empty/relative components and dynamic-string tokens the
-       loader expands, absolute paths that are missing or unsearchable at patch
-       time but may appear at run time (e.g. /run/opengl-driver/lib on NixOS),
-       and glibc-hwcaps directories the loader probes for. */
-    const auto needsSearchHint = [](const std::string & dir) {
-        if (dir.empty() || dir[0] != '/')
-            return true;
-        if (dir.find('$') != std::string::npos)
-            return true;
-        struct stat st;
-        if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)
-            || access(dir.c_str(), X_OK) != 0)
-            return true;
-        return access((dir + "/glibc-hwcaps").c_str(), F_OK) == 0;
     };
     for (const auto & dir : runPath) {
         if (needsSearchHint(dir)) {
