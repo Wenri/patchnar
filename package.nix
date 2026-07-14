@@ -25,12 +25,12 @@ gcc14Stdenv.mkDerivation {
     boost
     sourceHighlight
   ];
-  # Set compile-time constants
-  # old-glibc: patchnar depends on this glibc, so if it changes, patchnar rebuilds
+  # Set compile-time constants. (There is no --with-old-glibc: the standard
+  # glibc -> android glibc substitution is expressed at runtime as an entry in
+  # the --mappings table, so no compile-time constant is needed.)
   configureFlags = [
     "--with-source-highlight-data-dir=${sourceHighlight}/share/source-highlight"
     "--with-install-prefix=${installationDir}"
-    "--with-old-glibc=${gcc14Stdenv.cc.libc}"
   ];
   # Disable tests - some patchelf tests fail on aarch64 but patchnar works
   doCheck = false;
