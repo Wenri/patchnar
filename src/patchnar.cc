@@ -48,13 +48,23 @@ static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
 
 
-// Path mappings for inter-package reference substitution.
-// Maps old FULL store path to new FULL path (may live outside /nix/store, e.g.
-// under /data/data/com.termux.nix/nix/ for Android symlink layer).  Byte-level
-// find-and-replace on NAR content; requires OLD and NEW to be the same length
-// so binary offsets in ELF `.rodata` etc. stay stable.
-// e.g. "/nix/store/abc123...-bash-5.2" -> "/data/data/com.termux.nix/nix/xyz1..."
+// Byte-level path mappings.  Applied only to raw NAR/ELF content buffers
+// (applyPathMappings) where the substring at a given offset must be
+// replaced in place; requires OLD and NEW to be the same length so binary
+// offsets in ELF `.rodata` etc. stay stable.  On Android, NEW typically
+// points into the /data/data/com.termux.nix/nix/ symlink layer (real
+// filesystem, kernel-resolvable — needed for static ELFs whose .rodata
+// paths bypass the fakechroot LD_PRELOAD).
+// e.g. "/nix/store/abc...-bash-5.2" -> "/data/data/com.termux.nix/nix/xyz1..."
 static std::map<std::string, std::string> pathMappings;
+
+// Structural path mappings.  Applied through length-flexible machinery
+// (patchelf setInterpreter / modifyRPath, NAR symlink target strings,
+// source-highlight for scripts, shebang text) so OLD and NEW may differ
+// in length.  Typically NEW is the full real filesystem path (under
+// installationDir) — no symlink hop needed at runtime for interp/RPATH.
+// e.g. "/nix/store/abc...-bash-5.2" -> "/data/data/com.termux.nix/files/usr/nix/store/xyz...-bash-5.2"
+static std::map<std::string, std::string> realPathMappings;
 
 // Custom PreFormatter that translates Nix store paths in string literals
 // Extends CharTranslator for glibc regex replacement + manual prefix/hash handling
@@ -74,8 +84,8 @@ protected:
         // 1. Apply CharTranslator's regex (glibc replacement)
         std::string result = CharTranslator::doPreformat(text);
 
-        // 2. Apply path mappings (full-path substitution; dynamic lookup)
-        for (const auto& [oldPath, newPath] : pathMappings) {
+        // 2. Apply STRUCTURAL path mappings (any length; scripts are text)
+        for (const auto& [oldPath, newPath] : realPathMappings) {
             size_t pos = 0;
             while ((pos = result.find(oldPath, pos)) != std::string::npos) {
                 result.replace(pos, oldPath.length(), newPath);
@@ -164,11 +174,8 @@ static inline bool shouldSkipByExtension(const std::string& filename)
 
 
 
-// Add a single mapping from full store paths.
-// Validates full-path length match (required for byte-safe substitution in
-// NAR content, ELF `.rodata`, etc.).  OLD and NEW may live under different
-// prefixes (e.g. /nix/store/... -> /data/data/com.termux.nix/nix/...) as long
-// as full-path lengths are equal.
+// Add a single BYTE-LEVEL mapping.  Validates full-path length match —
+// required for byte-safe in-place substitution in NAR/ELF content buffers.
 static void addMapping(const std::string& oldPath, const std::string& newPath)
 {
     if (oldPath.length() == newPath.length()) {
@@ -181,9 +188,18 @@ static void addMapping(const std::string& oldPath, const std::string& newPath)
     }
 }
 
-// Load mappings from file.
-// Format: one mapping per line: "/OLD_FULL_PATH /NEW_FULL_PATH"
-static void loadMappings(const std::string& filename)
+// Add a single STRUCTURAL mapping.  No length check — used by patchelf,
+// source-highlight, and NAR symlink-string builders, all of which accept
+// any target length.
+static void addRealMapping(const std::string& oldPath, const std::string& newPath)
+{
+    debug("  real mapping: %s -> %s\n", oldPath.c_str(), newPath.c_str());
+    realPathMappings.emplace(oldPath, newPath);
+}
+
+// Parse "OLD NEW"-per-line file into a caller-supplied consumer.
+template<class Add>
+static void loadMappingsFile(const std::string& filename, Add&& add)
 {
     std::ifstream file(filename);
     if (!file) {
@@ -198,12 +214,20 @@ static void loadMappings(const std::string& filename)
         size_t space = line.find(' ');
         if (space == std::string::npos) continue;
 
-        std::string oldPath = line.substr(0, space);
-        std::string newPath = line.substr(space + 1);
-        addMapping(oldPath, newPath);
+        add(line.substr(0, space), line.substr(space + 1));
     }
+}
 
+static void loadMappings(const std::string& filename)
+{
+    loadMappingsFile(filename, addMapping);
     debug("patchnar: loaded %zu path mappings\n", pathMappings.size());
+}
+
+static void loadRealMappings(const std::string& filename)
+{
+    loadMappingsFile(filename, addRealMapping);
+    debug("patchnar: loaded %zu real path mappings\n", realPathMappings.size());
 }
 
 // Apply path mappings to content (byte-level find-and-replace).
@@ -273,13 +297,14 @@ static std::string replaceAll(std::string str,
     return str;
 }
 
-// Apply path mappings to a string (for symlinks, etc.).
+// Apply STRUCTURAL path mappings to a string (for ELF interp/RPATH,
+// symlink targets, script literals — all length-flexible).
 // Returns the original string if no mappings match (avoids copy).
-static std::string applyPathMappingsToString(std::string str)
+static std::string applyRealPathMappingsToString(std::string str)
 {
-    if (pathMappings.empty()) return str;
+    if (realPathMappings.empty()) return str;
 
-    for (const auto& [oldPath, newPath] : pathMappings) {
+    for (const auto& [oldPath, newPath] : realPathMappings) {
         size_t pos = 0;
         while ((pos = str.find(oldPath, pos)) != std::string::npos) {
             str.replace(pos, oldPath.length(), newPath);
@@ -289,9 +314,10 @@ static std::string applyPathMappingsToString(std::string str)
     return str;
 }
 
-// Unified store path transformation (glibc → path mappings → prefix)
-// Used by: ELF interpreter, RPATH entries, symlinks
-// Order matters: glibc must be replaced before path mappings are applied
+// Unified store path transformation for STRUCTURAL rewrites (any length).
+// Used by: ELF interpreter, RPATH entries, symlinks, shebangs.
+// Order: glibc first, then real-path mappings, then prefix injection for
+// any remaining raw /nix/store/ paths.
 static std::string transformStorePath(std::string path)
 {
     // 1. Replace old glibc with Android glibc (must be first)
@@ -299,8 +325,8 @@ static std::string transformStorePath(std::string path)
         path = replaceAll(std::move(path), oldGlibcPath, glibcPath);
     }
 
-    // 2. Apply path mappings for inter-package references
-    path = applyPathMappingsToString(std::move(path));
+    // 2. Apply real-path mappings for inter-package references
+    path = applyRealPathMappingsToString(std::move(path));
 
     // 3. Add prefix to /nix/store paths
     if (path.rfind("/nix/store/", 0) == 0) {
@@ -447,8 +473,8 @@ static std::vector<std::byte> patchShebangOnly(const std::span<const std::byte> 
         newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
     }
 
-    // Apply path mappings
-    newShebang = applyPathMappingsToString(std::move(newShebang));
+    // Apply structural path mappings (shebang text is length-flexible)
+    newShebang = applyRealPathMappingsToString(std::move(newShebang));
 
     // Add prefix to all /nix/store paths
     size_t pos = 2;  // Skip #!
@@ -565,10 +591,14 @@ static void showHelp(const char* progName)
               << "\n"
               << "Options:\n"
               << "  --glibc PATH         Android glibc store path (to replace old-glibc)\n"
-              << "  --mappings FILE      Full-path mappings for inter-package refs.\n"
-              << "                       Format: OLD_PATH NEW_PATH (one per line);\n"
-              << "                       OLD and NEW must have equal FULL-PATH length.\n"
-              << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
+              << "  --mappings FILE      BYTE-LEVEL mappings — used for the post-ELF\n"
+              << "                       .rodata pass.  Format: OLD NEW per line; OLD\n"
+              << "                       and NEW must have equal FULL-PATH length.\n"
+              << "  --real-mappings FILE STRUCTURAL mappings — used for ELF interp/RPATH,\n"
+              << "                       NAR symlink targets, script literals, shebangs.\n"
+              << "                       Format: OLD NEW per line; any length OK.\n"
+              << "  --self-mapping MAP   Self-reference mapping (populates both tables;\n"
+              << "                       format: \"OLD_PATH NEW_PATH\")\n"
               << "  --add-prefix-to PATH Additional path pattern to prefix in script strings\n"
               << "  --add-lang LANG      Additional language to patch (e.g., python.lang, json.lang)\n"
               << "  --debug              Enable debug output\n"
@@ -580,6 +610,7 @@ int main(int argc, char** argv)
     static struct option longOptions[] = {
         {"glibc",                    required_argument, nullptr, 'g'},
         {"mappings",                 required_argument, nullptr, 'm'},
+        {"real-mappings",            required_argument, nullptr, 'M'},
         {"self-mapping",             required_argument, nullptr, 's'},
         {"add-prefix-to",            required_argument, nullptr, 'A'},
         {"add-lang",                 required_argument, nullptr, 'L'},
@@ -589,13 +620,16 @@ int main(int argc, char** argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "g:m:s:A:L:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "g:m:M:s:A:L:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
         case 'g':
             glibcPath = optarg;
             break;
         case 'm':
             loadMappings(optarg);
+            break;
+        case 'M':
+            loadRealMappings(optarg);
             break;
         case 's': {
             // Parse "OLD_PATH NEW_PATH" format
@@ -604,7 +638,10 @@ int main(int argc, char** argv)
             if (space != std::string::npos) {
                 std::string oldPath = arg.substr(0, space);
                 std::string newPath = arg.substr(space + 1);
+                // Populate both tables — self-refs appear in both byte-level
+                // (.rodata) and structural (interp/RPATH/symlink) contexts.
                 addMapping(oldPath, newPath);
+                addRealMapping(oldPath, newPath);
                 debug("patchnar: self-mapping: %s -> %s\n", oldPath.c_str(), newPath.c_str());
             } else {
                 std::cerr << "patchnar: error: --self-mapping requires \"OLD_PATH NEW_PATH\" format\n";
