@@ -48,10 +48,13 @@ static std::vector<std::string> addPrefixToPaths = {"/nix/var/"};
 
 
 
-// Hash mappings for inter-package reference substitution
-// Maps old store path basename to new store path basename
-// e.g., "abc123...-bash-5.2" -> "xyz789...-bash-5.2"
-static std::map<std::string, std::string> hashMappings;
+// Path mappings for inter-package reference substitution.
+// Maps old FULL store path to new FULL path (may live outside /nix/store, e.g.
+// under /data/data/com.termux.nix/nix/ for Android symlink layer).  Byte-level
+// find-and-replace on NAR content; requires OLD and NEW to be the same length
+// so binary offsets in ELF `.rodata` etc. stay stable.
+// e.g. "/nix/store/abc123...-bash-5.2" -> "/data/data/com.termux.nix/nix/xyz1..."
+static std::map<std::string, std::string> pathMappings;
 
 // Custom PreFormatter that translates Nix store paths in string literals
 // Extends CharTranslator for glibc regex replacement + manual prefix/hash handling
@@ -71,12 +74,12 @@ protected:
         // 1. Apply CharTranslator's regex (glibc replacement)
         std::string result = CharTranslator::doPreformat(text);
 
-        // 2. Apply hash mappings (dynamic lookup - can't use regex)
-        for (const auto& [oldHash, newHash] : hashMappings) {
+        // 2. Apply path mappings (full-path substitution; dynamic lookup)
+        for (const auto& [oldPath, newPath] : pathMappings) {
             size_t pos = 0;
-            while ((pos = result.find(oldHash, pos)) != std::string::npos) {
-                result.replace(pos, oldHash.length(), newHash);
-                pos += newHash.length();
+            while ((pos = result.find(oldPath, pos)) != std::string::npos) {
+                result.replace(pos, oldPath.length(), newPath);
+                pos += newPath.length();
             }
         }
 
@@ -161,27 +164,25 @@ static inline bool shouldSkipByExtension(const std::string& filename)
 
 
 
-// Add a single hash mapping from full store paths
-// Extracts basenames and validates length match
+// Add a single mapping from full store paths.
+// Validates full-path length match (required for byte-safe substitution in
+// NAR content, ELF `.rodata`, etc.).  OLD and NEW may live under different
+// prefixes (e.g. /nix/store/... -> /data/data/com.termux.nix/nix/...) as long
+// as full-path lengths are equal.
 static void addMapping(const std::string& oldPath, const std::string& newPath)
 {
-    // Extract basename (everything after last /)
-    std::string oldBase = oldPath.substr(oldPath.rfind('/') + 1);
-    std::string newBase = newPath.substr(newPath.rfind('/') + 1);
-
-    // Validate same length (required for safe substitution in NAR)
-    if (oldBase.length() == newBase.length()) {
-        debug("  mapping: %s -> %s\n", oldBase.c_str(), newBase.c_str());
-        hashMappings.emplace(std::move(oldBase), std::move(newBase));
+    if (oldPath.length() == newPath.length()) {
+        debug("  mapping: %s -> %s\n", oldPath.c_str(), newPath.c_str());
+        pathMappings.emplace(oldPath, newPath);
     } else {
-        std::cerr << "patchnar: warning: skipping mapping " << oldBase
-                  << " -> " << newBase << " (length mismatch: "
-                  << oldBase.length() << " vs " << newBase.length() << ")\n";
+        std::cerr << "patchnar: warning: skipping mapping " << oldPath
+                  << " -> " << newPath << " (length mismatch: "
+                  << oldPath.length() << " vs " << newPath.length() << ")\n";
     }
 }
 
-// Load hash mappings from file
-// Format: one mapping per line: "/nix/store/old-hash-name /nix/store/new-hash-name"
+// Load mappings from file.
+// Format: one mapping per line: "/OLD_FULL_PATH /NEW_FULL_PATH"
 static void loadMappings(const std::string& filename)
 {
     std::ifstream file(filename);
@@ -202,24 +203,25 @@ static void loadMappings(const std::string& filename)
         addMapping(oldPath, newPath);
     }
 
-    debug("patchnar: loaded %zu hash mappings\n", hashMappings.size());
+    debug("patchnar: loaded %zu path mappings\n", pathMappings.size());
 }
 
-// Apply hash mappings to content (text substitution, like sed)
-// This replaces old store path basenames with new ones
-static void applyHashMappings(std::vector<std::byte>& content)
+// Apply path mappings to content (byte-level find-and-replace).
+// Requires OLD and NEW full paths to be the same length so binary offsets
+// (ELF `.rodata` strings, etc.) stay stable.
+static void applyPathMappings(std::vector<std::byte>& content)
 {
-    if (hashMappings.empty()) return;
+    if (pathMappings.empty()) return;
 
     // Convert to string for easier manipulation
     std::string str(reinterpret_cast<const char*>(content.data()), content.size());
     bool modified = false;
 
-    for (const auto& [oldHash, newHash] : hashMappings) {
+    for (const auto& [oldPath, newPath] : pathMappings) {
         size_t pos = 0;
-        while ((pos = str.find(oldHash, pos)) != std::string::npos) {
-            str.replace(pos, oldHash.length(), newHash);
-            pos += newHash.length();
+        while ((pos = str.find(oldPath, pos)) != std::string::npos) {
+            str.replace(pos, oldPath.length(), newPath);
+            pos += newPath.length();
             modified = true;
         }
     }
@@ -271,25 +273,25 @@ static std::string replaceAll(std::string str,
     return str;
 }
 
-// Apply hash mappings to a string (for symlinks, etc.)
-// Returns the original string if no mappings match (avoids copy)
-static std::string applyHashMappingsToString(std::string str)
+// Apply path mappings to a string (for symlinks, etc.).
+// Returns the original string if no mappings match (avoids copy).
+static std::string applyPathMappingsToString(std::string str)
 {
-    if (hashMappings.empty()) return str;
+    if (pathMappings.empty()) return str;
 
-    for (const auto& [oldHash, newHash] : hashMappings) {
+    for (const auto& [oldPath, newPath] : pathMappings) {
         size_t pos = 0;
-        while ((pos = str.find(oldHash, pos)) != std::string::npos) {
-            str.replace(pos, oldHash.length(), newHash);
-            pos += newHash.length();
+        while ((pos = str.find(oldPath, pos)) != std::string::npos) {
+            str.replace(pos, oldPath.length(), newPath);
+            pos += newPath.length();
         }
     }
     return str;
 }
 
-// Unified store path transformation (glibc → hash mapping → prefix)
+// Unified store path transformation (glibc → path mappings → prefix)
 // Used by: ELF interpreter, RPATH entries, symlinks
-// Order matters: glibc must be replaced before hash mappings are applied
+// Order matters: glibc must be replaced before path mappings are applied
 static std::string transformStorePath(std::string path)
 {
     // 1. Replace old glibc with Android glibc (must be first)
@@ -297,8 +299,8 @@ static std::string transformStorePath(std::string path)
         path = replaceAll(std::move(path), oldGlibcPath, glibcPath);
     }
 
-    // 2. Apply hash mappings for inter-package references
-    path = applyHashMappingsToString(std::move(path));
+    // 2. Apply path mappings for inter-package references
+    path = applyPathMappingsToString(std::move(path));
 
     // 3. Add prefix to /nix/store paths
     if (path.rfind("/nix/store/", 0) == 0) {
@@ -445,8 +447,8 @@ static std::vector<std::byte> patchShebangOnly(const std::span<const std::byte> 
         newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
     }
 
-    // Apply hash mappings
-    newShebang = applyHashMappingsToString(std::move(newShebang));
+    // Apply path mappings
+    newShebang = applyPathMappingsToString(std::move(newShebang));
 
     // Add prefix to all /nix/store paths
     size_t pos = 2;  // Skip #!
@@ -509,7 +511,7 @@ static std::vector<std::byte> patchContent(
         auto result = isElf32(content)
             ? patchElfContent<ElfFile<Elf32_Ehdr, Elf32_Phdr, Elf32_Shdr, Elf32_Addr, Elf32_Off, Elf32_Dyn, Elf32_Sym, Elf32_Versym, Elf32_Verdef, Elf32_Verdaux, Elf32_Verneed, Elf32_Vernaux, Elf32_Rel, Elf32_Rela, 32>>(content, executable)
             : patchElfContent<ElfFile<Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Addr, Elf64_Off, Elf64_Dyn, Elf64_Sym, Elf64_Versym, Elf64_Verdef, Elf64_Verdaux, Elf64_Verneed, Elf64_Vernaux, Elf64_Rel, Elf64_Rela, 64>>(content, executable);
-        applyHashMappings(result);
+        applyPathMappings(result);
         return result;
     }
 
@@ -517,7 +519,7 @@ static std::vector<std::byte> patchContent(
     if (shouldSkipByExtension(filename)) {
         debug("  skipping %s (non-patchable extension)\n", path.c_str());
         auto result = std::vector<std::byte>(content.begin(), content.end());
-        applyHashMappings(result);
+        applyPathMappings(result);
         return result;
     }
 
@@ -543,7 +545,7 @@ static std::vector<std::byte> patchContent(
         result = std::vector<std::byte>(content.begin(), content.end());
     }
 
-    applyHashMappings(result);
+    applyPathMappings(result);
     return result;
 }
 
@@ -563,8 +565,9 @@ static void showHelp(const char* progName)
               << "\n"
               << "Options:\n"
               << "  --glibc PATH         Android glibc store path (to replace old-glibc)\n"
-              << "  --mappings FILE      Hash mappings file for inter-package refs\n"
-              << "                       Format: OLD_PATH NEW_PATH (one per line)\n"
+              << "  --mappings FILE      Full-path mappings for inter-package refs.\n"
+              << "                       Format: OLD_PATH NEW_PATH (one per line);\n"
+              << "                       OLD and NEW must have equal FULL-PATH length.\n"
               << "  --self-mapping MAP   Self-reference mapping (format: \"OLD_PATH NEW_PATH\")\n"
               << "  --add-prefix-to PATH Additional path pattern to prefix in script strings\n"
               << "  --add-lang LANG      Additional language to patch (e.g., python.lang, json.lang)\n"
