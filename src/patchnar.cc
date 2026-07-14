@@ -36,10 +36,10 @@
 
 // Configuration (compile-time constants from configure)
 static const std::string prefix = INSTALL_PREFIX;
-static const std::string oldGlibcPath = OLD_GLIBC_PATH;
+// (glibc replacement is now handled uniformly through --mappings; the
+// standard glibc -> android glibc pair is just another entry there.)
 
 // Runtime configuration
-static std::string glibcPath;
 static bool debugMode = false;
 
 // Additional paths to prefix in script strings
@@ -66,34 +66,33 @@ static std::map<std::string, std::string> pathMappings;
 // e.g. "/nix/store/abc...-bash-5.2" -> "/data/data/com.termux.nix/files/usr/nix/store/xyz...-bash-5.2"
 static std::map<std::string, std::string> realPathMappings;
 
+// Apply the two-layer mapping to a string.  Layer 1 (pathMappings,
+// byte-level, same-length: OLD -> SYMLINK) always applies.  Layer 2
+// (realPathMappings, structural, any length: SYMLINK -> REAL) applies
+// where the string can be resized (scripts, ELF sections via patchelf).
+// Same-length replacements collapse through both layers to a direct
+// real-path reference; cross-length replacements (e.g. glibc) stay at
+// SYMLINK after Layer 2 since realPathMappings has no entry, and the
+// kernel resolves the symlink at runtime.
+//
+// Forward-declared here — defined after `applyPathMappingsToString`.
+static std::string applyLayeredRewrite(std::string str);
+
 // Custom PreFormatter that translates Nix store paths in string literals
-// Extends CharTranslator for glibc regex replacement + manual prefix/hash handling
+// via the two-layer rewrite + installationDir prefix injection for any
+// remaining raw /nix/store/ paths.
 class NixPathTranslator : public srchilite::CharTranslator {
 public:
-    NixPathTranslator() : srchilite::CharTranslator() {
-        // Use CharTranslator's regex for glibc path replacement
-        if (!oldGlibcPath.empty() && !glibcPath.empty()) {
-            static const auto escaped = boost::regex_replace(
-                oldGlibcPath, boost::regex(R"([.^$|()[\]{}*+?\\])"), R"(\\$&)");
-            set_translation(escaped, glibcPath);
-        }
-    }
+    NixPathTranslator() : srchilite::CharTranslator() {}
 
 protected:
     const std::string doPreformat(const std::string& text) override {
-        // 1. Apply CharTranslator's regex (glibc replacement)
-        std::string result = CharTranslator::doPreformat(text);
+        // Layer 1 + Layer 2: OLD -> SYMLINK -> REAL where possible.
+        std::string result = applyLayeredRewrite(text);
 
-        // 2. Apply STRUCTURAL path mappings (any length; scripts are text)
-        for (const auto& [oldPath, newPath] : realPathMappings) {
-            size_t pos = 0;
-            while ((pos = result.find(oldPath, pos)) != std::string::npos) {
-                result.replace(pos, oldPath.length(), newPath);
-                pos += newPath.length();
-            }
-        }
-
-        // 3. Add prefix to /nix/store/ paths (with already-prefixed check)
+        // Add installationDir prefix to any remaining /nix/store/ paths
+        // (paths not in either mapping table — e.g. cutoff packages) and
+        // /nix/var/ or other caller-supplied prefixes.
         if (!prefix.empty()) {
             size_t pos = 0;
             while ((pos = result.find("/nix/store/", pos)) != std::string::npos) {
@@ -106,7 +105,6 @@ protected:
                 pos += 11;  // Skip "/nix/store/"
             }
 
-            // Add prefix to additional paths (e.g., /nix/var/)
             for (const auto& pattern : addPrefixToPaths) {
                 pos = 0;
                 while ((pos = result.find(pattern, pos)) != std::string::npos) {
@@ -256,6 +254,23 @@ static void applyPathMappings(std::vector<std::byte>& content)
     }
 }
 
+// Apply BYTE-LEVEL path mappings (Layer 1) to a string.  Same semantics
+// as `applyPathMappings(content)` but operating on `std::string` — used
+// as the first stage of the layered rewrite in `applyLayeredRewrite`.
+static std::string applyPathMappingsToString(std::string str)
+{
+    if (pathMappings.empty()) return str;
+
+    for (const auto& [oldPath, newPath] : pathMappings) {
+        size_t pos = 0;
+        while ((pos = str.find(oldPath, pos)) != std::string::npos) {
+            str.replace(pos, oldPath.length(), newPath);
+            pos += newPath.length();
+        }
+    }
+    return str;
+}
+
 // Check if content is an ELF file
 static inline bool isElf(const std::span<const std::byte> content)
 {
@@ -297,9 +312,8 @@ static std::string replaceAll(std::string str,
     return str;
 }
 
-// Apply STRUCTURAL path mappings to a string (for ELF interp/RPATH,
-// symlink targets, script literals — all length-flexible).
-// Returns the original string if no mappings match (avoids copy).
+// Apply STRUCTURAL path mappings to a string (Layer 2: SYMLINK -> REAL,
+// any length).  Used inside applyLayeredRewrite; not called directly.
 static std::string applyRealPathMappingsToString(std::string str)
 {
     if (realPathMappings.empty()) return str;
@@ -314,21 +328,28 @@ static std::string applyRealPathMappingsToString(std::string str)
     return str;
 }
 
+// Two-layer rewrite (forward-declared above for NixPathTranslator).
+// Layer 1: pathMappings (OLD -> SYMLINK, byte-safe, covers every rewritten
+// closure ref including cross-length pairs like glibc).
+// Layer 2: realPathMappings (SYMLINK -> REAL, structural, same-length pairs
+// only — cross-length pairs stay at SYMLINK and rely on kernel-level
+// symlink resolution at runtime).
+static std::string applyLayeredRewrite(std::string str)
+{
+    str = applyPathMappingsToString(std::move(str));
+    str = applyRealPathMappingsToString(std::move(str));
+    return str;
+}
+
 // Unified store path transformation for STRUCTURAL rewrites (any length).
 // Used by: ELF interpreter, RPATH entries, symlinks, shebangs.
-// Order: glibc first, then real-path mappings, then prefix injection for
-// any remaining raw /nix/store/ paths.
+// Order: layered rewrite (Layer 1 then Layer 2), then installationDir
+// prefix injection for any remaining raw /nix/store/ path prefix (cutoff
+// packages, or paths not in the closure).
 static std::string transformStorePath(std::string path)
 {
-    // 1. Replace old glibc with Android glibc (must be first)
-    if (!oldGlibcPath.empty() && path.find(oldGlibcPath) != std::string::npos) {
-        path = replaceAll(std::move(path), oldGlibcPath, glibcPath);
-    }
+    path = applyLayeredRewrite(std::move(path));
 
-    // 2. Apply real-path mappings for inter-package references
-    path = applyRealPathMappingsToString(std::move(path));
-
-    // 3. Add prefix to /nix/store paths
     if (path.rfind("/nix/store/", 0) == 0) {
         path.insert(0, prefix);
     }
@@ -339,16 +360,6 @@ static std::string transformStorePath(std::string path)
 // Patch symlink target (takes by value to allow move semantics)
 static std::string patchSymlink(std::string target)
 {
-    // Handle relative symlinks with glibc basename (e.g., ../../hash-glibc/lib/...)
-    // This must be done before transformStorePath since relative paths won't match oldGlibcPath
-    if (!oldGlibcPath.empty() && target.find(oldGlibcPath) == std::string::npos) {
-        const auto oldBase = oldGlibcPath.substr(oldGlibcPath.rfind('/') + 1);
-        const auto newBase = glibcPath.substr(glibcPath.rfind('/') + 1);
-        if (!oldBase.empty() && target.find(oldBase) != std::string::npos) {
-            target = replaceAll(std::move(target), oldBase, newBase);
-        }
-    }
-
     return transformStorePath(std::move(target));
 }
 
@@ -464,19 +475,13 @@ static std::vector<std::byte> patchShebangOnly(const std::span<const std::byte> 
         return {content.begin(), content.end()};
     }
 
-    // Apply transformations to the shebang
-    // Note: transformStorePath only handles one path, so we need to find all paths
-    std::string newShebang = shebang;
+    // Apply the two-layer rewrite (Layer 1: OLD -> SYMLINK; Layer 2:
+    // SYMLINK -> REAL for same-length pairs).  Shebang text is
+    // length-flexible so both layers are safe here.
+    std::string newShebang = applyLayeredRewrite(shebang);
 
-    // Replace glibc paths
-    if (!oldGlibcPath.empty()) {
-        newShebang = replaceAll(std::move(newShebang), oldGlibcPath, glibcPath);
-    }
-
-    // Apply structural path mappings (shebang text is length-flexible)
-    newShebang = applyRealPathMappingsToString(std::move(newShebang));
-
-    // Add prefix to all /nix/store paths
+    // Add prefix to any remaining /nix/store paths (cutoff packages,
+    // paths not in the closure).
     size_t pos = 2;  // Skip #!
     while ((pos = newShebang.find("/nix/store/", pos)) != std::string::npos) {
         if (pos < prefix.length() ||
@@ -584,21 +589,22 @@ static void showHelp(const char* progName)
               << "\n"
               << "Compile-time settings:\n"
               << "  prefix:              " << prefix << "\n"
-              << "  old-glibc:           " << oldGlibcPath << "\n"
               << "  source-highlight:    " << sourceHighlightDataDir << "\n"
               << "  add-prefix-to:       /nix/var/ (default)\n"
               << "  patchable-langs:     sh.lang, zsh.lang (default)\n"
               << "\n"
               << "Options:\n"
-              << "  --glibc PATH         Android glibc store path (to replace old-glibc)\n"
-              << "  --mappings FILE      BYTE-LEVEL mappings — used for the post-ELF\n"
-              << "                       .rodata pass.  Format: OLD NEW per line; OLD\n"
-              << "                       and NEW must have equal FULL-PATH length.\n"
-              << "  --real-mappings FILE STRUCTURAL mappings — used for ELF interp/RPATH,\n"
-              << "                       NAR symlink targets, script literals, shebangs.\n"
-              << "                       Format: OLD NEW per line; any length OK.\n"
-              << "  --self-mapping MAP   Self-reference mapping (populates both tables;\n"
-              << "                       format: \"OLD_PATH NEW_PATH\")\n"
+              << "  --mappings FILE      Layer 1 (byte-level) mappings — applied to all\n"
+              << "                       NAR content including ELF .rodata.  Format:\n"
+              << "                       OLD NEW per line; OLD and NEW must have equal\n"
+              << "                       full-path length (safe for byte substitution).\n"
+              << "  --real-mappings FILE Layer 2 (structural) mappings — applied after\n"
+              << "                       Layer 1 on ELF interp/RPATH, NAR symlink targets,\n"
+              << "                       script literals, and shebangs.  Any length OK.\n"
+              << "                       Typically maps SYMLINK -> REAL to skip a runtime\n"
+              << "                       symlink hop for length-preservable references.\n"
+              << "  --self-mapping MAP   Self-reference (populates only Layer 1; format:\n"
+              << "                       \"OLD_PATH NEW_PATH\")\n"
               << "  --add-prefix-to PATH Additional path pattern to prefix in script strings\n"
               << "  --add-lang LANG      Additional language to patch (e.g., python.lang, json.lang)\n"
               << "  --debug              Enable debug output\n"
@@ -608,7 +614,6 @@ static void showHelp(const char* progName)
 int main(int argc, char** argv)
 {
     static struct option longOptions[] = {
-        {"glibc",                    required_argument, nullptr, 'g'},
         {"mappings",                 required_argument, nullptr, 'm'},
         {"real-mappings",            required_argument, nullptr, 'M'},
         {"self-mapping",             required_argument, nullptr, 's'},
@@ -620,11 +625,8 @@ int main(int argc, char** argv)
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "g:m:M:s:A:L:dh", longOptions, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:s:A:L:dh", longOptions, nullptr)) != -1) {
         switch (opt) {
-        case 'g':
-            glibcPath = optarg;
-            break;
         case 'm':
             loadMappings(optarg);
             break;
@@ -632,16 +634,15 @@ int main(int argc, char** argv)
             loadRealMappings(optarg);
             break;
         case 's': {
-            // Parse "OLD_PATH NEW_PATH" format
+            // Parse "OLD_PATH NEW_PATH" format.  Self-ref only appears in
+            // byte-level substitution contexts (Layer 1 catches it before
+            // any Layer 2 pass would see the OLD side).
             std::string arg = optarg;
             size_t space = arg.find(' ');
             if (space != std::string::npos) {
                 std::string oldPath = arg.substr(0, space);
                 std::string newPath = arg.substr(space + 1);
-                // Populate both tables — self-refs appear in both byte-level
-                // (.rodata) and structural (interp/RPATH/symlink) contexts.
                 addMapping(oldPath, newPath);
-                addRealMapping(oldPath, newPath);
                 debug("patchnar: self-mapping: %s -> %s\n", oldPath.c_str(), newPath.c_str());
             } else {
                 std::cerr << "patchnar: error: --self-mapping requires \"OLD_PATH NEW_PATH\" format\n";
@@ -668,8 +669,6 @@ int main(int argc, char** argv)
     }
 
     debug("patchnar: prefix=%s\n", prefix.c_str());
-    debug("patchnar: glibc=%s\n", glibcPath.c_str());
-    debug("patchnar: old-glibc=%s\n", oldGlibcPath.c_str());
     debug("patchnar: source-highlight-data-dir=%s\n", sourceHighlightDataDir.c_str());
     for (const auto& path : addPrefixToPaths) {
         debug("patchnar: add-prefix-to=%s\n", path.c_str());
