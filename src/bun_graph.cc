@@ -15,6 +15,8 @@
 #include <vector>
 #include <memory>
 #include <cerrno>
+#include <string_view>
+#include <cctype>
 
 #include "elf.h"
 #include "patchelf.h"
@@ -78,6 +80,118 @@ static bool findBunSection(FileContents fc, BunSection& out) {
         fprintf(stderr, "ELF error: %s\n", e.what());
         return false;
     }
+}
+
+// ---- Embedded statically-linked CLI tools (busybox-style argv[0] dispatch) ----
+//
+// The Anthropic Bun fork links ripgrep / ugrep / bfs and sandbox-runtime's
+// apply-seccomp directly into the single `claude` executable and selects one
+// by basename(argv[0]) at startup (a strlen(argv0)-keyed classifier accepting
+// exactly "rg", "ug", "ugrep", "bfs", "apply-seccomp"; any other argv0 runs
+// Claude Code).  Their machine code is merged into .text with no per-program
+// boundary, so — unlike the .bun module graph above — they cannot be carved
+// out as files.  What we CAN do is confirm which tools are linked in by
+// scanning the runtime's .rodata for each tool's unique signature string.
+//
+// We scan .rodata ONLY, never .bun: the embedded cli.js (in .bun) mentions
+// these same tool names, so a whole-file scan would false-match (verified:
+// "apply-seccomp" occurs in both sections; the search-tool names occur in
+// cli.js too).  .rodata belongs to the statically-linked tools themselves.
+struct EmbeddedTool {
+    const char* name;
+    const char* argv0;                 // display: comma-joined dispatch aliases
+    std::vector<const char*> anchors;  // ALL must be present in .rodata
+};
+static const std::vector<EmbeddedTool> EMBEDDED_TOOLS = {
+    {"ripgrep",       "rg",            {"BurntSushi/ripgrep"}},
+    {"ugrep",         "ug, ugrep",     {"ugrep user manual"}},
+    {"bfs",           "bfs",           {"bfs contributors"}},
+    {"apply-seccomp", "apply-seccomp", {"apply-seccomp"}},
+};
+
+// Length of a leading dotted-numeric version (>=2 groups, e.g. "7.5.0"), else 0.
+static size_t semverLen(std::string_view s) {
+    size_t i = 0; int groups = 0;
+    while (i < s.size()) {
+        size_t d = i;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') i++;
+        if (i == d) break;
+        groups++;
+        if (i < s.size() && s[i] == '.') { i++; continue; }
+        break;
+    }
+    return groups >= 2 ? i : 0;
+}
+
+// Best-effort version for a detected tool (empty when not stored as a literal;
+// ripgrep and bfs construct their banners at runtime, so only ugrep/ripgrep
+// expose something recoverable from a static scan).
+static std::string toolVersion(std::string_view name, std::string_view ro) {
+    if (name == "ugrep") {
+        for (size_t p = ro.find("ugrep "); p != std::string_view::npos; p = ro.find("ugrep ", p + 1)) {
+            size_t L = semverLen(ro.substr(p + 6));
+            if (L) return std::string(ro.substr(p + 6, L));
+        }
+    } else if (name == "ripgrep") {
+        // ripgrep stores "<semver><git-rev>" adjacently (clap version! + rev).
+        for (size_t p = 0; p + 8 < ro.size(); ++p) {
+            if (ro[p] < '0' || ro[p] > '9') continue;
+            size_t L = semverLen(ro.substr(p));
+            if (L < 5) continue;  // want "14.1.1"-style, not a bare "1.0"
+            if (p > 0 && (std::isalnum((unsigned char)ro[p - 1]) || ro[p - 1] == '.')) continue;
+            size_t h = p + L, hn = 0;
+            while (h + hn < ro.size() && hn < 12 && std::isxdigit((unsigned char)ro[h + hn])) hn++;
+            if (hn >= 7) {
+                std::string v(ro.substr(p, L));
+                v += " (rev "; v.append(ro.substr(h, 10)); v += ")";
+                return v;
+            }
+        }
+    }
+    return {};
+}
+
+template<class ElfFileType>
+static bool findRodataRange(FileContents fc, size_t& off, size_t& size) {
+    try {
+        ElfFileType elfFile(fc);
+        auto info = elfFile.findSection(".rodata");
+        if (!info) return false;
+        off = info->offset; size = info->size;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Print which embedded tools are statically linked into the executable.
+static void scanEmbeddedTools(FileContents fc) {
+    printf("\n--- embedded native tools (statically linked, argv[0]-dispatched) ---\n");
+    size_t ro_off = 0, ro_sz = 0;
+    bool ok = isElf32(fc) ? findRodataRange<ElfFile32>(fc, ro_off, ro_sz)
+                          : findRodataRange<ElfFile64>(fc, ro_off, ro_sz);
+    if (!ok || ro_off + ro_sz > fc->size()) {
+        printf("  (.rodata not found — cannot scan)\n");
+        return;
+    }
+    std::string_view ro(reinterpret_cast<const char*>(fc->data()) + ro_off, ro_sz);
+    size_t found = 0;
+    for (const auto& t : EMBEDDED_TOOLS) {
+        bool present = true;
+        for (const char* a : t.anchors)
+            if (ro.find(a) == std::string_view::npos) { present = false; break; }
+        if (present) {
+            std::string ver = toolVersion(t.name, ro);
+            printf("  %-14s argv0: %-16s [linked]%s%s\n",
+                   t.name, t.argv0, ver.empty() ? "" : "  version: ", ver.c_str());
+            ++found;
+        } else {
+            printf("  %-14s argv0: %-16s [NOT FOUND — upstream may have changed]\n",
+                   t.name, t.argv0);
+        }
+    }
+    printf("total: %zu/%zu known embedded tools linked in\n", found, EMBEDDED_TOOLS.size());
+    printf("  (signature scan of .rodata; argv[0] keys are this Bun fork's applet classifier)\n");
 }
 
 // A resolved entry discovered in the directory region.
@@ -427,6 +541,9 @@ int main(int argc, char** argv) {
         if (!e.bytecode_origin_path.empty())
             printf("  bytecode_origin_path: %s\n", e.bytecode_origin_path.c_str());
     }
+
+    // Report statically-linked CLI tools multiplexed into this executable.
+    scanEmbeddedTools(fileContents);
 
     if (extract) {
         printf("\n--- extracting ---\n");
