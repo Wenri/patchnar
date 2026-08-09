@@ -433,9 +433,13 @@ int main(int argc, char** argv) {
         memcpy(&bcop_off, rec + 40, 4);
         memcpy(&bcop_len, rec + 44, 4);
 
-        // Resolve name - StringPointer.offset is directly into the payload
+        // Resolve name - StringPointer.offset is directly into the payload.
+        // A StringPointer signals "absent" with length == 0, NOT offset == 0:
+        // offset 0 is the first byte of the payload, and Bun serialises the
+        // entry point's name there.  Rejecting offset 0 therefore dropped the
+        // application's own module from every report and from --extract.
         size_t nreal = (size_t)name_off;
-        if (name_off == 0 || nreal + name_len > bun.size) continue;
+        if (name_len == 0 || nreal + name_len > bun.size) continue;
         if (!is_bunfs_path(sec + nreal, name_len, bun.size)) continue;
 
         Entry e{};
@@ -446,9 +450,18 @@ int main(int argc, char** argv) {
 
         // Resolve contents - StringPointer.offset is directly into the blob
         size_t creal = (size_t)cont_off;
-        if (cont_off > 0 && cont_len >= 4 && creal + cont_len <= bun.size) {
+        if (cont_len >= 4 && creal + cont_len <= bun.size) {
             const uint8_t* cp = sec + creal;
-            if (cont_len >= 7 && memcmp(cp, "// @bun", 7) == 0) {
+            // Bun preserves the entry point's shebang, so the "// @bun" banner
+            // is not always at byte 0.  Skip one leading "#!" line before
+            // testing, or the application module is misfiled as raw binary and
+            // extracted without its /$bunfs string rewriting.
+            size_t banner = 0;
+            if (cont_len > 2 && cp[0] == '#' && cp[1] == '!') {
+                while (banner < cont_len && cp[banner] != '\n') ++banner;
+                if (banner < cont_len) ++banner;
+            }
+            if (cont_len - banner >= 7 && memcmp(cp + banner, "// @bun", 7) == 0) {
                 e.kind = "js";
                 e.has_content = true;
             } else if (memcmp(cp, "\x7f""ELF", 4) == 0) {
@@ -470,20 +483,20 @@ int main(int argc, char** argv) {
 
         // Resolve bytecode - StringPointer at bytes 24-31 (JSC pre-compiled bytecode)
         size_t bcreal = (size_t)bc_off;
-        if (bc_off > 0 && bc_len > 0 && bcreal + bc_len <= bun.size) {
+        if (bc_len > 0 && bcreal + bc_len <= bun.size) {
             e.has_bytecode = true;
             e.stored_bytecode_off = bc_off;
             e.bytecode_len = bc_len;
         }
 
         // Resolve remaining StringPointers
-        if (sm_off > 0 && sm_len > 0 && (size_t)sm_off + sm_len <= bun.size) {
+        if (sm_len > 0 && (size_t)sm_off + sm_len <= bun.size) {
             e.stored_sourcemap_off = sm_off;
             e.sourcemap_len = sm_len;
         }
-        if (mi_off > 0 && mi_len > 0 && (size_t)mi_off + mi_len <= bun.size)
+        if (mi_len > 0 && (size_t)mi_off + mi_len <= bun.size)
             e.module_info.assign(reinterpret_cast<const char*>(sec + mi_off), mi_len);
-        if (bcop_off > 0 && bcop_len > 0 && (size_t)bcop_off + bcop_len <= bun.size)
+        if (bcop_len > 0 && (size_t)bcop_off + bcop_len <= bun.size)
             e.bytecode_origin_path.assign(reinterpret_cast<const char*>(sec + bcop_off), bcop_len);
 
         // Metadata byte fields
@@ -494,6 +507,14 @@ int main(int argc, char** argv) {
 
         entries.push_back(std::move(e));
     }
+
+    // Every 52-byte record in the directory should yield one entry.  A record
+    // that fails the checks above is dropped silently, so the module vanishes
+    // from both the report and --extract while the run still exits 0 — and
+    // callers gate their builds on this output.  Make any shortfall loud.
+    if (entries.size() != module_count)
+        fprintf(stderr, "warning: %zu of %zu directory records did not parse as modules\n",
+                module_count - entries.size(), module_count);
 
     printf("\n%-4s %-50s %-12s %-10s %-12s %-10s %-12s %-10s %s\n",
            "idx", "path", "name_off", "name_len", "content_off", "content_len",
