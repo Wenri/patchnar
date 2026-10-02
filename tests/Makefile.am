@@ -2,13 +2,16 @@
 # Uses autotools parallel-tests feature
 
 # Path to built patchnar binary
-PATCHNAR = $(top_builddir)/src/patchnar
+# Tests change into temporary directories before invoking these binaries.
+PATCHNAR = $(abs_top_builddir)/src/patchnar
+PATCHELF = $(abs_top_builddir)/src/patchelf
 
 # Export for test scripts
-export PATCHNAR
+export PATCHNAR PATCHELF CC
 
 # Shell-based integration tests
 TESTS = \
+	test-elf-load-mapping.sh \
 	test-transform-store-path.sh \
 	test-shebang-patching.sh \
 	test-comment-patching.sh \
