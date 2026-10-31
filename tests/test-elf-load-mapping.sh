@@ -1,8 +1,11 @@
 #!/bin/sh
 # Regressions from upstream patchelf's executable-page-growth.sh,
 # strip-gap-rewrite.sh (including e21fc60's headerBase precondition and
-# 59acc3d9's 64 KiB page case) and executable-header-rewrite.sh (59acc3d9:
-# header LOAD reuse without overlapping mappings).
+# 59acc3d9's 64 KiB page case), executable-header-rewrite.sh (59acc3d9:
+# header LOAD reuse without overlapping mappings) and
+# header-load-pht-growth.sh (ed1f1921: header LOAD lookup by sizeof(Elf_Ehdr)
+# when PT_NOTE splitting grows the program header table past the previous
+# header LOAD's end).
 set -eu
 
 if test "$(uname -m)" != x86_64 || test "$(uname)" != Linux; then
@@ -162,3 +165,70 @@ for rpath in present absent; do
     done
 done
 echo "PASS: executable header rewrite keeps LOAD mappings disjoint"
+
+# Several 4-byte aligned notes grouped into one PT_NOTE before .dynsym so a
+# .dynstr rewrite relocates and splits them, growing the program header table
+# past the slack of a header LOAD created by an earlier .interp rewrite
+# (upstream's header-load-pht-growth.sh / ed1f1921).
+cat > notes-after-interp.c <<'EOF'
+#define NOTE(name)                                   \
+    __asm__(".section .note." #name ",\"a\",%note\n" \
+            ".p2align 2\n"                           \
+            ".long 4, 4, 1\n"                        \
+            ".asciz \"Tst\"\n"                       \
+            ".long 0\n"                              \
+            ".previous\n");
+
+NOTE(one)
+NOTE(two)
+NOTE(three)
+
+int main(void) { return 0; }
+EOF
+cat > notes-after-interp.ld <<'EOF'
+SECTIONS
+{
+  .note.one : { *(.note.one) }
+  .note.two : { *(.note.two) }
+  .note.three : { *(.note.three) }
+}
+INSERT BEFORE .dynsym;
+EOF
+$CC -fno-pie -no-pie notes-after-interp.c -L. -Wl,--disable-new-dtags \
+    -Wl,-rpath-link,. -Wl,-rpath,/nonexistent \
+    -Wl,-T,notes-after-interp.ld -o notes-after-interp
+
+check_phdr_covered() {
+    phdr=$("$READELF" -lW "$1" | awk '$1 == "PHDR" { print $2, $5 }')
+    read -r phdr_offset phdr_size <<EOF
+$phdr
+EOF
+    phdr_end=$((phdr_offset + phdr_size))
+    "$READELF" -lW "$1" | awk '$1 == "LOAD" { print $2, $5 }' | {
+        covered=0
+        while read -r offset size; do
+            if test "$((offset))" -le "$((phdr_offset))" &&
+                test "$((offset + size))" -ge "$phdr_end"; then
+                covered=1
+            fi
+        done
+        test "$covered" -eq 1
+    }
+}
+
+cp notes-after-interp notes-pht-growth
+interp_orig=$("$PATCHELF" --print-interpreter notes-pht-growth)
+interp_plus8="$(dirname "$interp_orig")/////////$(basename "$interp_orig")"
+"$PATCHELF" --set-interpreter "$interp_plus8" notes-pht-growth
+"$PATCHELF" --set-rpath "$workdir:$(printf '%0200d' 0)" notes-pht-growth
+check_phdr_covered notes-pht-growth
+check_load_pages notes-pht-growth
+check_dynamic_writable notes-pht-growth
+./notes-pht-growth
+
+"$PATCHELF" --add-rpath "$(printf '%06000d' 0)" notes-pht-growth
+check_phdr_covered notes-pht-growth
+check_load_pages notes-pht-growth
+check_dynamic_writable notes-pht-growth
+./notes-pht-growth
+echo "PASS: header LOAD preserves PHDR coverage after PT_NOTE split"
