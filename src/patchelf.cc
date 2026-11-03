@@ -3366,7 +3366,8 @@ ElfFile<ElfFileParamNames>::findSection(const SectionName & sectionName) const
         return {};
     return SectionInfo{
         static_cast<size_t>(rdi(shdr->get().sh_offset)),
-        static_cast<size_t>(rdi(shdr->get().sh_size))
+        static_cast<size_t>(rdi(shdr->get().sh_size)),
+        static_cast<uint64_t>(rdi(shdr->get().sh_addr))
     };
 }
 

@@ -1,6 +1,7 @@
 // bun_graph.cc - Parse a Bun --compile ELF and print its Standalone Module Graph.
 //   part of patchnar - built via autotools (shares ElfFile from patchelf)
 //   run:    ./bun_graph <bun-compiled-elf> [--extract DIR]
+//           ./bun_graph <bun-compiled-elf> --natives   (JSON: private runtime entry points)
 
 #include <cstdint>
 #include <cstring>
@@ -194,6 +195,207 @@ static void scanEmbeddedTools(FileContents fc) {
     printf("  (signature scan of .rodata; argv[0] keys are this Bun fork's applet classifier)\n");
 }
 
+// ---- Private runtime entry points (--natives) ----
+//
+// TaskSolver's unbundled Claude Code (claude/unbundle.py) runs this same private Bun
+// without its module graph and calls a few of its stripped entry points: JSC's module
+// bytecode generator and the CachedBytecode release (to emit .jsc sidecars), BunString ->
+// WTF::String (for its UTF-8 loader shim), and the one call through which the
+// already-bundled source loader clones file contents as Latin-1 (the shim replaces it).
+// Every release relinks the fork, so their addresses move; their instructions mostly
+// don't.  --natives prints one JSON object with each virtual address, found by masked
+// x86-64 signatures that must match exactly once in .text; a miss exits 2 naming it.
+struct NativeSignature {
+    const char* name;
+    const char* pattern;  // hex bytes; "??" matches a displacement that moves per build
+};
+static const NativeSignature NATIVE_SIGNATURES[] = {
+    // ZigSourceProvider.cpp's C-ABI module bytecode generator: an argument-shuffling
+    // thunk that calls the generator body placed right after it.
+    {"module_bytecode_generator",
+     "55 48 89 e5 48 83 ec 20 4c 89 c0 41 89 c8 89 d1 0f 28 45 10 0f 11 44 24 08 "
+     "4c 89 0c 24 ba 01 00 00 00 49 89 c1 e8 ?? ?? ?? ?? 48 83 c4 20 5d c3"},
+    // JSC::CachedBytecode's destructor.
+    {"cached_bytecode_destructor",
+     "55 48 89 e5 41 57 41 56 53 50 48 89 fb 8b 47 64 4c 8b 77 58 48 85 c0 75 2d "
+     "83 7b 60 00 78 78 4d 85 f6"},
+    // mimalloc's mi_free; 49 bytes, since its first 36 also open two sibling functions.
+    {"mi_free",
+     "55 48 89 e5 48 89 fe 48 8b 05 ?? ?? ?? ?? 48 89 f9 48 c1 e9 1d 48 8b 44 c8 50 89 f1 "
+     "c1 e9 0d 81 e1 f8 ff 00 00 48 8b 3c 08 48 85 ff 74 29 48 8b 07"},
+    // BunString -> WTF::String, returned through rdi (rsi is the BunString).
+    {"bun_string_to_wtf",
+     "55 48 89 e5 53 50 48 89 fb 0f b6 06 83 f8 03 75 1d 48 8b 46 08 48 8b 56 10 "
+     "48 89 df 48 89 c6 e8 ?? ?? ?? ??"},
+};
+
+static std::vector<int> parseSignature(const char* text) {
+    std::vector<int> bytes;
+    for (const char* p = text; *p;) {
+        if (*p == ' ') { ++p; continue; }
+        if (p[0] == '?' && p[1] == '?') bytes.push_back(-1);
+        else bytes.push_back(static_cast<int>(std::stoul(std::string(p, 2), nullptr, 16)));
+        p += 2;
+    }
+    return bytes;
+}
+
+static std::vector<size_t> findSignature(std::string_view text, const std::vector<int>& signature) {
+    std::string literal;  // the leading run up to the first wildcard narrows the scan
+    for (int byte : signature) {
+        if (byte < 0) break;
+        literal.push_back(static_cast<char>(byte));
+    }
+    std::vector<size_t> hits;
+    for (size_t at = text.find(literal); at != std::string_view::npos && at + signature.size() <= text.size();
+         at = text.find(literal, at + 1)) {
+        bool match = true;
+        for (size_t i = literal.size(); match && i < signature.size(); ++i)
+            match = signature[i] < 0 || static_cast<uint8_t>(text[at + i]) == signature[i];
+        if (match) hits.push_back(at);
+    }
+    return hits;
+}
+
+static uint8_t byteAt(std::string_view text, size_t at) { return static_cast<uint8_t>(text[at]); }
+
+// bun.String.cloneLatin1: malloc(len + 0x14) (lea rdi, [reg+0x14]; call; test rax, rax), then
+// an 8-bit WTF::StringImpl header: refcount 2 at [p] and the 8-bit flag 4 at [p+0x10].
+// [r12] and [r12+0x10] take a SIB byte (c7 04 24 / c7 44 24 10).
+static bool isLatin1Clone(std::string_view text, size_t function) {
+    if (function >= text.size()) return false;
+    std::string_view body = text.substr(function, 0x60);
+    auto storeAt = [&](size_t at, uint8_t displacement, uint8_t value) -> size_t {
+        if (at + 2 > body.size() || byteAt(body, at) != 0xc7) return 0;
+        uint8_t modrm = byteAt(body, at + 1);
+        size_t operand = at + 2;
+        if (displacement == 0 ? modrm == 0x04 : modrm == 0x44) {
+            if (operand >= body.size() || byteAt(body, operand) != 0x24) return 0;
+            ++operand;
+        } else if (displacement == 0 ? (modrm > 0x07 || modrm == 0x04 || modrm == 0x05)
+                                     : (modrm < 0x40 || modrm > 0x47 || modrm == 0x44)) {
+            return 0;
+        }
+        if (displacement != 0) {
+            if (operand >= body.size() || byteAt(body, operand) != displacement) return 0;
+            ++operand;
+        }
+        if (operand + 4 > body.size() || byteAt(body, operand) != value ||
+            body.substr(operand + 1, 3) != std::string_view("\0\0\0", 3))
+            return 0;
+        return operand + 4;
+    };
+    for (size_t i = 0; i + 12 <= body.size(); ++i) {
+        uint8_t rex = byteAt(body, i), modrm = byteAt(body, i + 2);
+        if ((rex != 0x48 && rex != 0x49) || byteAt(body, i + 1) != 0x8d || modrm < 0x78 || modrm > 0x7f ||
+            byteAt(body, i + 3) != 0x14 || byteAt(body, i + 4) != 0xe8 ||
+            body.substr(i + 9, 3) != "\x48\x85\xc0")
+            continue;
+        for (size_t refs = i + 14; refs <= i + 30 && refs < body.size(); ++refs) {
+            size_t end = storeAt(refs, 0, 0x02);
+            if (!end) continue;
+            for (size_t flags = end; flags <= end + 24 && flags < body.size(); ++flags)
+                if (storeAt(flags, 0x10, 0x04)) return true;
+        }
+    }
+    return false;
+}
+
+// The already-bundled branch of Bun's module loader builds its ResolvedSource from
+// bun.String.cloneLatin1(contents), then input_specifier.createIfDifferent(path.text):
+//   e8 rel32               call  <clone>
+//   48 8b 85 d32 | 45 d8   mov   rax, [rbp-d]
+//   48 8b 70 20            mov   rsi, [rax+0x20]       (the specifier)
+//   (up to 8 bytes)        mov   rax, [rbp-d]          (the path)
+//   48 8b 50 20 48 8b 48 28 mov  rdx/rcx, path.text
+//   48 8d 7d|bd            lea   rdi, [rbp-d]
+// The same argument setup follows other calls in that function; the site is the one
+// whose callee is a Latin-1 clone.
+struct CloneCall { size_t call; size_t clone; };
+static std::vector<CloneCall> findCloneCalls(std::string_view text) {
+    static const std::string_view path_text("\x48\x8b\x50\x20\x48\x8b\x48\x28\x48\x8d", 10);
+    static const std::string_view specifier("\x48\x8b\x70\x20", 4);
+    std::vector<CloneCall> calls;
+    for (size_t at = text.find(path_text); at != std::string_view::npos; at = text.find(path_text, at + 1)) {
+        if (at + path_text.size() >= text.size()) break;
+        uint8_t lea = byteAt(text, at + path_text.size());
+        if (lea != 0x7d && lea != 0xbd) continue;
+        for (size_t gap = 0; gap <= 8; ++gap) {
+            if (at < gap + specifier.size() + 4 + 5) break;
+            size_t load = at - gap - specifier.size();
+            if (text.substr(load, specifier.size()) != specifier) continue;
+            for (size_t width : {static_cast<size_t>(7), static_cast<size_t>(4)}) {
+                if (load < width + 5) continue;
+                size_t frame = load - width;
+                if (byteAt(text, frame) != 0x48 || byteAt(text, frame + 1) != 0x8b ||
+                    byteAt(text, frame + 2) != (width == 7 ? 0x85 : 0x45))
+                    continue;
+                size_t call = frame - 5;
+                if (byteAt(text, call) != 0xe8) continue;
+                int32_t relative;
+                memcpy(&relative, text.data() + call + 1, 4);
+                int64_t target = static_cast<int64_t>(call) + 5 + relative;
+                bool seen = false;
+                for (const auto& known : calls) seen = seen || known.call == call;
+                if (!seen && target >= 0 && static_cast<size_t>(target) < text.size() &&
+                    isLatin1Clone(text, static_cast<size_t>(target)))
+                    calls.push_back({call, static_cast<size_t>(target)});
+            }
+        }
+    }
+    return calls;
+}
+
+template<class ElfFileType>
+static bool findTextSection(FileContents fc, size_t& off, size_t& size, uint64_t& addr) {
+    try {
+        ElfFileType elfFile(fc);
+        auto info = elfFile.findSection(".text");
+        if (!info) return false;
+        off = info->offset; size = info->size; addr = info->addr;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static int printNatives(FileContents fc) {
+    const auto& bytes = *fc;
+    if (isElf32(fc) || bytes.size() < 20 || bytes[EI_DATA] != ELFDATA2LSB ||
+        (bytes[18] | (bytes[19] << 8)) != EM_X86_64) {
+        fprintf(stderr, "--natives requires a little-endian x86-64 ELF64 executable\n");
+        return 2;
+    }
+    size_t off = 0, size = 0;
+    uint64_t addr = 0;
+    if (!findTextSection<ElfFile64>(fc, off, size, addr) || off + size > bytes.size()) {
+        fprintf(stderr, ".text section not found\n");
+        return 2;
+    }
+    std::string_view text(reinterpret_cast<const char*>(bytes.data()) + off, size);
+    std::vector<std::pair<std::string, uint64_t>> found;
+    for (const auto& native : NATIVE_SIGNATURES) {
+        auto hits = findSignature(text, parseSignature(native.pattern));
+        if (hits.size() != 1) {
+            fprintf(stderr, "%s: %zu signature matches in .text, not 1\n", native.name, hits.size());
+            return 2;
+        }
+        found.emplace_back(native.name, addr + hits[0]);
+    }
+    auto calls = findCloneCalls(text);
+    if (calls.size() != 1) {
+        fprintf(stderr, "bundled_source_clone_call: %zu loader call sites, not 1\n", calls.size());
+        return 2;
+    }
+    found.emplace_back("latin1_clone", addr + calls[0].clone);
+    found.emplace_back("bundled_source_clone_call", addr + calls[0].call);
+    printf("{\"format\": 1, \"natives\": {");
+    for (size_t i = 0; i < found.size(); ++i)
+        printf("%s\"%s\": %" PRIu64, i ? ", " : "", found[i].first.c_str(), found[i].second);
+    printf("}}\n");
+    return 0;
+}
+
 // A resolved entry discovered in the directory region.
 struct Entry {
     size_t dir_offset;        // byte offset inside the directory region
@@ -298,14 +500,16 @@ public:
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract DIR]\n", argv[0]);
+        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract DIR | --natives]\n", argv[0]);
         return 1;
     }
 
-    bool extract = false;
+    bool extract = false, natives = false;
     std::string outdir = "/$bunfs";
     for (int ai = 2; ai < argc; ++ai) {
-        if (strcmp(argv[ai], "--extract") == 0) {
+        if (strcmp(argv[ai], "--natives") == 0) {
+            natives = true;
+        } else if (strcmp(argv[ai], "--extract") == 0) {
             if (ai + 1 >= argc) {
                 fprintf(stderr, "--extract requires a directory argument\n");
                 return 1;
@@ -321,9 +525,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (natives && extract) {
+        fprintf(stderr, "--natives and --extract are separate modes\n");
+        return 1;
+    }
+
     // Read file into memory using patchelf's FileContents type
     auto fileContents = readFileContents(argv[1]);
     if (!fileContents) return 1;
+    // --natives prints only its JSON report, for tools to parse.
+    if (natives) return printNatives(fileContents);
 
     // Find .bun section using patchelf's ElfFile (handles ELF32/64 + endianness)
     BunSection bun;

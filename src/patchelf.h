@@ -78,9 +78,10 @@ public:
     struct SectionInfo {
         size_t offset;
         size_t size;
+        uint64_t addr;  /* sh_addr: the section's virtual address */
     };
 
-    /* Find a section by name and return its file offset and size.
+    /* Find a section by name and return its file offset, size and address.
        Returns nullopt if the section is not found. */
     [[nodiscard]] std::optional<SectionInfo> findSection(const std::string & sectionName) const;
 
