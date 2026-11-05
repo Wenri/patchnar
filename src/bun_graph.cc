@@ -1,7 +1,8 @@
 // bun_graph.cc - Parse a Bun --compile ELF and print its Standalone Module Graph.
 //   part of patchnar - built via autotools (shares ElfFile from patchelf)
-//   run:    ./bun_graph <bun-compiled-elf> [--extract DIR]
-//           ./bun_graph <bun-compiled-elf> --natives   (JSON: private runtime entry points)
+//   run:    ./bun_graph <bun-compiled-elf> [--extract DIR [--no-bytecode]]
+//           ./bun_graph <bun-compiled-elf> --natives     (JSON: private runtime entry points)
+//           ./bun_graph <bun-compiled-elf> --clean OUT   (the runtime without its payload)
 
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <algorithm>
+#include <utility>
 #include <cerrno>
 #include <string_view>
 #include <cctype>
@@ -498,17 +501,423 @@ public:
     }
 };
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract DIR | --natives]\n", argv[0]);
+// ---- The payload's place in an ELF64 image, and --clean ----
+//
+// `bun build --compile` appends the standalone module graph to the runtime as
+// [u64 length][payload], the `.bun` section.  Two layouts exist
+// (oven-sh/bun src/exe_format/elf_payload.rs):
+//
+//   section   up to Bun 1.4: the writable PT_LOAD grows to cover the payload,
+//             placed page-aligned past .bss.  The section header is repointed.
+//   segment   since 2026-10-27 (bun build --compile --aot): a PT_BUN_PAYLOAD
+//             header spans the payload at the highest address, followed by up
+//             to three PT_LOAD pieces (data, ahead-of-time compiled code, data),
+//             written into program headers the runtime reserved.  llvm-strip
+//             may duplicate a section no single segment contains, so the
+//             segment, not the section, is the payload's authority.
+//
+// Either way the linked `.bun` location, BUN_COMPILED right after .data, holds
+// the payload's virtual address; the runtime reads it to find the graph.
+//
+// `--clean OUT` writes the runtime without the payload: the span leaves the
+// file, the headers that mapped it shrink (section layout) or go back to
+// PT_NULL (segment layout), BUN_COMPILED is cleared, the `.bun` header goes
+// and the tail (non-loaded sections, the section header table) moves down.
+// Everything the loader maps stays byte for byte: the caller compares.
+
+namespace elf64 {
+
+constexpr uint32_t PT_BUN_PAYLOAD = 0x6fb00002;
+constexpr size_t MAX_PIECES = 3;
+
+struct Image {
+    explicit Image(FileContents contents) : fc(std::move(contents)) {}
+
+    FileContents fc;
+    Elf64_Ehdr ehdr{};
+    std::vector<Elf64_Phdr> phdrs;
+    std::vector<Elf64_Shdr> shdrs;
+    std::string shstrtab;
+
+    size_t size() const { return fc->size(); }
+    const uint8_t* data() const { return fc->data(); }
+
+    bool inFile(uint64_t offset, uint64_t length) const {
+        return offset <= size() && length <= size() - offset;
+    }
+
+    std::string_view name(const Elf64_Shdr& sh) const {
+        if (sh.sh_name >= shstrtab.size()) return {};
+        std::string_view rest(shstrtab.data() + sh.sh_name, shstrtab.size() - sh.sh_name);
+        return rest.substr(0, rest.find('\0'));
+    }
+
+    // A little-endian x86-64 ELF64 executable with its tables inside the file.
+    bool parse(std::string& error) {
+        if (size() < sizeof(Elf64_Ehdr) || memcmp(data(), ELFMAG, SELFMAG) != 0) {
+            error = "not an ELF file"; return false;
+        }
+        memcpy(&ehdr, data(), sizeof ehdr);
+        if (ehdr.e_ident[EI_CLASS] != ELFCLASS64 || ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+            ehdr.e_machine != EM_X86_64) {
+            error = "requires a little-endian x86-64 ELF64 file"; return false;
+        }
+        if (ehdr.e_phentsize != sizeof(Elf64_Phdr) || ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+            error = "unexpected program or section header size"; return false;
+        }
+        if (!inFile(ehdr.e_phoff, uint64_t(ehdr.e_phnum) * sizeof(Elf64_Phdr)) ||
+            !inFile(ehdr.e_shoff, uint64_t(ehdr.e_shnum) * sizeof(Elf64_Shdr)) ||
+            ehdr.e_shnum == 0 || ehdr.e_shstrndx >= ehdr.e_shnum) {
+            error = "program or section header table outside the file"; return false;
+        }
+        phdrs.resize(ehdr.e_phnum);
+        memcpy(phdrs.data(), data() + ehdr.e_phoff, phdrs.size() * sizeof(Elf64_Phdr));
+        shdrs.resize(ehdr.e_shnum);
+        memcpy(shdrs.data(), data() + ehdr.e_shoff, shdrs.size() * sizeof(Elf64_Shdr));
+        const Elf64_Shdr& names = shdrs[ehdr.e_shstrndx];
+        if (names.sh_type != SHT_STRTAB || !inFile(names.sh_offset, names.sh_size)) {
+            error = "section name table outside the file"; return false;
+        }
+        shstrtab.assign(reinterpret_cast<const char*>(data() + names.sh_offset), names.sh_size);
+        for (const Elf64_Shdr& sh : shdrs) {
+            if (sh.sh_type != SHT_NOBITS && sh.sh_type != SHT_NULL && !inFile(sh.sh_offset, sh.sh_size)) {
+                error = "section '" + std::string(name(sh)) + "' outside the file"; return false;
+            }
+        }
+        for (const Elf64_Phdr& ph : phdrs) {
+            if (ph.p_type != PT_NULL && !inFile(ph.p_offset, ph.p_filesz)) {
+                error = "program header outside the file"; return false;
+            }
+        }
+        return true;
+    }
+
+    int sectionIndex(std::string_view wanted) const {
+        for (size_t i = 0; i < shdrs.size(); ++i)
+            if (shdrs[i].sh_type != SHT_NULL && name(shdrs[i]) == wanted) return int(i);
+        return -1;
+    }
+
+    uint64_t pageSize() const {
+        uint64_t page = 0;
+        for (const Elf64_Phdr& ph : phdrs)
+            if (ph.p_type == PT_LOAD && ph.p_align > page) page = ph.p_align;
+        return page ? page : 0x1000;
+    }
+};
+
+static uint64_t alignUp(uint64_t value, uint64_t align) {
+    if (align < 2) return value;
+    return (value + align - 1) / align * align;
+}
+
+enum class Layout { Section, Segment };
+
+struct Payload {
+    Layout layout = Layout::Section;
+    int section = -1;             // the `.bun` header, -1 when stripped
+    int segment = -1;             // PT_BUN_PAYLOAD, or the PT_LOAD the section ends
+    std::vector<int> pieces;      // the reserved headers after PT_BUN_PAYLOAD
+    bool aot = false;             // a piece maps ahead-of-time compiled code
+    uint64_t file_offset = 0;     // [u64 length][payload]
+    uint64_t vaddr = 0;
+    uint64_t length = 0;          // the payload behind its length
+    uint64_t span_offset = 0;     // the page-aligned file span that leaves on --clean
+    uint64_t span_end = 0;
+};
+
+static bool locatePayload(const Image& image, Payload& out, std::string& error) {
+    Payload p;
+    p.section = image.sectionIndex(".bun");
+    for (size_t i = 0; i < image.phdrs.size(); ++i)
+        if (image.phdrs[i].p_type == PT_BUN_PAYLOAD) {
+            if (p.segment >= 0) { error = "two PT_BUN_PAYLOAD headers"; return false; }
+            p.segment = int(i);
+        }
+    if (p.segment >= 0) {
+        const Elf64_Phdr& span = image.phdrs[p.segment];
+        p.layout = Layout::Segment;
+        p.file_offset = span.p_offset;
+        p.vaddr = span.p_vaddr;
+        p.span_offset = span.p_offset;
+        p.span_end = span.p_offset + span.p_filesz;
+        if (span.p_filesz != span.p_memsz || span.p_filesz < 8) {
+            error = "PT_BUN_PAYLOAD does not span a file-backed payload"; return false;
+        }
+        for (size_t i = p.segment + 1; i < image.phdrs.size() && p.pieces.size() < MAX_PIECES; ++i) {
+            const Elf64_Phdr& ph = image.phdrs[i];
+            bool inside = ph.p_type == PT_LOAD && ph.p_vaddr >= span.p_vaddr &&
+                          ph.p_vaddr + ph.p_memsz <= span.p_vaddr + span.p_memsz;
+            if (ph.p_type != PT_NULL && !inside) break;
+            if (inside && (ph.p_flags & PF_X)) p.aot = true;
+            p.pieces.push_back(int(i));
+        }
+        if (p.section >= 0) {
+            const Elf64_Shdr& sh = image.shdrs[p.section];
+            if (sh.sh_addr != span.p_vaddr || sh.sh_offset != span.p_offset || sh.sh_size > span.p_filesz) {
+                error = ".bun section disagrees with PT_BUN_PAYLOAD"; return false;
+            }
+        }
+    } else {
+        if (p.section < 0) { error = ".bun section not found"; return false; }
+        const Elf64_Shdr& sh = image.shdrs[p.section];
+        if (sh.sh_type != SHT_PROGBITS || !(sh.sh_flags & SHF_ALLOC) || sh.sh_size < 8) {
+            error = ".bun is not a loaded section with a length"; return false;
+        }
+        for (size_t i = 0; i < image.phdrs.size(); ++i) {
+            const Elf64_Phdr& ph = image.phdrs[i];
+            if (ph.p_type == PT_LOAD && ph.p_vaddr <= sh.sh_addr && sh.sh_addr < ph.p_vaddr + ph.p_memsz) {
+                if (p.segment >= 0) { error = ".bun is mapped twice"; return false; }
+                p.segment = int(i);
+            }
+        }
+        if (p.segment < 0) { error = ".bun is not mapped"; return false; }
+        const Elf64_Phdr& ph = image.phdrs[p.segment];
+        p.file_offset = sh.sh_offset;
+        p.vaddr = sh.sh_addr;
+        p.span_offset = sh.sh_offset;
+        p.span_end = ph.p_offset + ph.p_filesz;
+        if (sh.sh_offset - ph.p_offset != sh.sh_addr - ph.p_vaddr ||
+            sh.sh_offset + sh.sh_size > p.span_end ||
+            alignUp(sh.sh_offset + sh.sh_size, image.pageSize()) < p.span_end) {
+            error = ".bun does not end its PT_LOAD"; return false;
+        }
+    }
+    if (!image.inFile(p.file_offset, 8)) { error = "payload length outside the file"; return false; }
+    memcpy(&p.length, image.data() + p.file_offset, 8);
+    uint64_t available = p.span_end - p.file_offset;
+    if (p.length > available - 8) { error = "payload length exceeds its span"; return false; }
+    if (p.section >= 0 && image.shdrs[p.section].sh_size != 8 + p.length) {
+        error = ".bun section size does not match the payload length"; return false;
+    }
+    out = p;
+    return true;
+}
+
+// The linked `.bun`: BUN_COMPILED, which the symbol table names, or the
+// 8-aligned slot right after .data where the linker placed it.  It holds the
+// payload's address.
+static bool locatePointer(const Image& image, const Payload& payload, uint64_t& file_offset,
+                          std::string& error) {
+    uint64_t vaddr = 0;
+    bool found = false;
+    for (const Elf64_Shdr& sh : image.shdrs) {
+        if (sh.sh_type != SHT_SYMTAB || sh.sh_link >= image.shdrs.size()) continue;
+        const Elf64_Shdr& strings = image.shdrs[sh.sh_link];
+        if (!image.inFile(strings.sh_offset, strings.sh_size)) continue;
+        std::string_view strtab(reinterpret_cast<const char*>(image.data() + strings.sh_offset), strings.sh_size);
+        for (uint64_t off = 0; off + sizeof(Elf64_Sym) <= sh.sh_size; off += sizeof(Elf64_Sym)) {
+            Elf64_Sym sym;
+            memcpy(&sym, image.data() + sh.sh_offset + off, sizeof sym);
+            if (sym.st_name >= strtab.size()) continue;
+            std::string_view rest = strtab.substr(sym.st_name);
+            if (rest.substr(0, rest.find('\0')) == "BUN_COMPILED") { vaddr = sym.st_value; found = true; }
+        }
+    }
+    if (!found) {
+        int data = image.sectionIndex(".data");
+        if (data < 0) { error = "neither BUN_COMPILED nor .data found"; return false; }
+        const Elf64_Shdr& sh = image.shdrs[data];
+        vaddr = alignUp(sh.sh_addr + sh.sh_size, 8);
+    }
+    for (const Elf64_Phdr& ph : image.phdrs) {
+        if (ph.p_type != PT_LOAD || vaddr < ph.p_vaddr || vaddr + 8 > ph.p_vaddr + ph.p_filesz) continue;
+        file_offset = ph.p_offset + (vaddr - ph.p_vaddr);
+        uint64_t stored;
+        memcpy(&stored, image.data() + file_offset, 8);
+        if (stored != payload.vaddr) {
+            char text[128];
+            snprintf(text, sizeof text, "the standalone-graph pointer holds 0x%" PRIx64 ", not the payload's 0x%" PRIx64,
+                     stored, payload.vaddr);
+            error = text;
+            return false;
+        }
+        return true;
+    }
+    error = "the standalone-graph pointer is not file-backed";
+    return false;
+}
+
+static bool writeAll(const char* path, const std::vector<uint8_t>& bytes) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+    if (fd < 0) { fprintf(stderr, "cannot create %s: %s\n", path, strerror(errno)); return false; }
+    size_t done = 0;
+    while (done < bytes.size()) {
+        ssize_t n = write(fd, bytes.data() + done, bytes.size() - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "cannot write %s: %s\n", path, strerror(errno));
+            close(fd);
+            return false;
+        }
+        done += size_t(n);
+    }
+    if (close(fd) != 0) { fprintf(stderr, "cannot close %s: %s\n", path, strerror(errno)); return false; }
+    return true;
+}
+
+static int cleanRuntime(FileContents fc, const char* out_path) {
+    Image image(fc);
+    std::string error;
+    if (!image.parse(error) || image.ehdr.e_type != ET_EXEC) {
+        fprintf(stderr, "--clean: %s\n", error.empty() ? "requires an ET_EXEC executable" : error.c_str());
+        return 1;
+    }
+    Payload payload;
+    if (!locatePayload(image, payload, error)) { fprintf(stderr, "--clean: %s\n", error.c_str()); return 1; }
+    uint64_t pointer;
+    if (!locatePointer(image, payload, pointer, error)) { fprintf(stderr, "--clean: %s\n", error.c_str()); return 1; }
+
+    // The bytes that leave: the whole payload span, and in the section layout
+    // also the zero page padding between the segment's last file-backed bytes
+    // and the page-aligned payload.
+    std::vector<Elf64_Phdr> phdrs = image.phdrs;
+    uint64_t cut_begin = payload.span_offset, cut_end = payload.span_end;
+    if (payload.layout == Layout::Segment) {
+        phdrs[payload.segment] = Elf64_Phdr{};
+        for (int piece : payload.pieces) phdrs[piece] = Elf64_Phdr{};
+    } else {
+        Elf64_Phdr& seg = phdrs[payload.segment];
+        uint64_t filesz = 0, memsz = 0;
+        for (size_t i = 0; i < image.shdrs.size(); ++i) {
+            const Elf64_Shdr& sh = image.shdrs[i];
+            if (int(i) == payload.section || !(sh.sh_flags & SHF_ALLOC) || sh.sh_type == SHT_NULL) continue;
+            if (sh.sh_addr < seg.p_vaddr || sh.sh_addr + sh.sh_size > seg.p_vaddr + seg.p_memsz) continue;
+            memsz = std::max(memsz, sh.sh_addr + sh.sh_size - seg.p_vaddr);
+            if (sh.sh_type != SHT_NOBITS) filesz = std::max(filesz, sh.sh_offset + sh.sh_size - seg.p_offset);
+        }
+        if (filesz == 0 || memsz < filesz) { fprintf(stderr, "--clean: the payload's PT_LOAD has no other sections\n"); return 1; }
+        // The pointer slot sits after .data, outside every section: keep it
+        // mapped and file-backed when nothing follows it in the segment.
+        if (pointer >= seg.p_offset && pointer < payload.span_offset) {
+            filesz = std::max(filesz, pointer + 8 - seg.p_offset);
+            memsz = std::max(memsz, filesz);
+        }
+        cut_begin = seg.p_offset + filesz;
+        seg.p_filesz = filesz;
+        seg.p_memsz = memsz;
+    }
+    if (cut_begin >= cut_end || image.ehdr.e_phoff + phdrs.size() * sizeof(Elf64_Phdr) > cut_begin ||
+        image.ehdr.e_shoff < cut_end) {
+        fprintf(stderr, "--clean: the header tables are not clear of the payload span\n");
+        return 1;
+    }
+    for (size_t i = 0; i < image.shdrs.size(); ++i) {
+        const Elf64_Shdr& sh = image.shdrs[i];
+        if (int(i) == payload.section || sh.sh_type == SHT_NOBITS || sh.sh_type == SHT_NULL) continue;
+        if (sh.sh_offset < cut_end && sh.sh_offset + sh.sh_size > cut_begin) {
+            fprintf(stderr, "--clean: section '%s' lies in the payload span\n", std::string(image.name(sh)).c_str());
+            return 1;
+        }
+    }
+    if (pointer + 8 > cut_begin && pointer < cut_end) pointer = UINT64_MAX;   // zero-filled once cut
+    if (pointer != UINT64_MAX && pointer + 8 > cut_begin) {
+        fprintf(stderr, "--clean: the standalone-graph pointer lies past the payload\n");
         return 1;
     }
 
-    bool extract = false, natives = false;
-    std::string outdir = "/$bunfs";
+    // The head, then every section the cut moves (packed at its alignment in
+    // file order), then the section header table.
+    std::vector<uint8_t> out(image.data(), image.data() + cut_begin);
+    if (pointer != UINT64_MAX) memset(out.data() + pointer, 0, 8);
+    std::vector<Elf64_Shdr> shdrs = image.shdrs;
+    std::vector<size_t> moved;
+    for (size_t i = 0; i < shdrs.size(); ++i) {
+        Elf64_Shdr& sh = shdrs[i];
+        if (int(i) == payload.section || sh.sh_type == SHT_NULL) continue;
+        if (sh.sh_type == SHT_NOBITS) {
+            if (sh.sh_offset >= cut_begin && sh.sh_offset < cut_end) sh.sh_offset = cut_begin;
+            else if (sh.sh_offset >= cut_end) sh.sh_offset -= cut_end - cut_begin;
+            continue;
+        }
+        if (sh.sh_offset >= cut_end) moved.push_back(i);
+    }
+    std::sort(moved.begin(), moved.end(), [&](size_t a, size_t b) {
+        return image.shdrs[a].sh_offset < image.shdrs[b].sh_offset;
+    });
+    for (size_t i : moved) {
+        Elf64_Shdr& sh = shdrs[i];
+        uint64_t at = alignUp(out.size(), sh.sh_addralign);
+        out.resize(at, 0);
+        out.insert(out.end(), image.data() + sh.sh_offset, image.data() + sh.sh_offset + sh.sh_size);
+        sh.sh_offset = at;
+    }
+
+    // Drop the `.bun` header: later indices move down by one wherever a
+    // header or a symbol names them.  Dynamic symbols stay: their section is
+    // loaded, and the runtime never reads their section index.
+    uint16_t removed = uint16_t(payload.section);
+    auto renumber = [&](uint32_t index) -> uint32_t { return index > removed && index < SHN_LORESERVE ? index - 1 : index; };
+    if (payload.section >= 0) {
+        for (Elf64_Shdr& sh : shdrs) {
+            sh.sh_link = renumber(sh.sh_link);
+            if (sh.sh_flags & SHF_INFO_LINK) sh.sh_info = renumber(sh.sh_info);
+        }
+        for (size_t i : moved) {
+            const Elf64_Shdr& sh = shdrs[i];
+            if (sh.sh_type != SHT_SYMTAB) continue;
+            for (uint64_t off = 0; off + sizeof(Elf64_Sym) <= sh.sh_size; off += sizeof(Elf64_Sym)) {
+                Elf64_Sym sym;
+                memcpy(&sym, out.data() + sh.sh_offset + off, sizeof sym);
+                sym.st_shndx = uint16_t(renumber(sym.st_shndx));
+                memcpy(out.data() + sh.sh_offset + off, &sym, sizeof sym);
+            }
+        }
+        shdrs.erase(shdrs.begin() + payload.section);
+    }
+    Elf64_Ehdr ehdr = image.ehdr;
+    ehdr.e_shoff = alignUp(out.size(), 8);
+    ehdr.e_shnum = uint16_t(shdrs.size());
+    if (payload.section >= 0) ehdr.e_shstrndx = uint16_t(renumber(ehdr.e_shstrndx));
+    out.resize(ehdr.e_shoff, 0);
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(shdrs.data()),
+               reinterpret_cast<const uint8_t*>(shdrs.data() + shdrs.size()));
+    memcpy(out.data(), &ehdr, sizeof ehdr);
+    memcpy(out.data() + ehdr.e_phoff, phdrs.data(), phdrs.size() * sizeof(Elf64_Phdr));
+
+    // Read the result back: the payload is unmapped, unnamed and unreferenced.
+    auto result = std::make_shared<std::vector<unsigned char>>(out.begin(), out.end());
+    Image check(result);
+    if (!check.parse(error) || check.sectionIndex(".bun") >= 0) {
+        fprintf(stderr, "--clean: the result is not a clean image: %s\n", error.c_str());
+        return 1;
+    }
+    for (const Elf64_Phdr& ph : check.phdrs) {
+        if ((ph.p_type == PT_LOAD || ph.p_type == PT_BUN_PAYLOAD) && ph.p_vaddr <= payload.vaddr &&
+            payload.vaddr < ph.p_vaddr + ph.p_memsz) {
+            fprintf(stderr, "--clean: the result still maps the payload\n");
+            return 1;
+        }
+    }
+    if (!writeAll(out_path, out)) return 1;
+    printf("clean runtime: %s (%zu bytes; removed the %s-layout payload, %" PRIu64 " bytes at 0x%" PRIx64 "%s)\n",
+           out_path, out.size(), payload.layout == Layout::Segment ? "segment" : "section",
+           payload.length, payload.vaddr, payload.aot ? ", ahead-of-time compiled" : "");
+    return 0;
+}
+
+}  // namespace elf64
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <bun-compiled-elf> [--extract DIR [--no-bytecode] | --natives | --clean OUT]\n", argv[0]);
+        return 1;
+    }
+
+    bool extract = false, natives = false, clean = false, no_bytecode = false;
+    std::string outdir = "/$bunfs", clean_path;
     for (int ai = 2; ai < argc; ++ai) {
         if (strcmp(argv[ai], "--natives") == 0) {
             natives = true;
+        } else if (strcmp(argv[ai], "--no-bytecode") == 0) {
+            no_bytecode = true;
+        } else if (strcmp(argv[ai], "--clean") == 0) {
+            if (ai + 1 >= argc) {
+                fprintf(stderr, "--clean requires an output path\n");
+                return 1;
+            }
+            clean = true;
+            clean_path = argv[++ai];
         } else if (strcmp(argv[ai], "--extract") == 0) {
             if (ai + 1 >= argc) {
                 fprintf(stderr, "--extract requires a directory argument\n");
@@ -525,8 +934,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (natives && extract) {
-        fprintf(stderr, "--natives and --extract are separate modes\n");
+    if (int(natives) + int(extract) + int(clean) > 1) {
+        fprintf(stderr, "--natives, --extract and --clean are separate modes\n");
+        return 1;
+    }
+    if (no_bytecode && !extract) {
+        fprintf(stderr, "--no-bytecode applies to --extract\n");
         return 1;
     }
 
@@ -535,14 +948,36 @@ int main(int argc, char** argv) {
     if (!fileContents) return 1;
     // --natives prints only its JSON report, for tools to parse.
     if (natives) return printNatives(fileContents);
+    if (clean) return elf64::cleanRuntime(fileContents, clean_path.c_str());
 
-    // Find .bun section using patchelf's ElfFile (handles ELF32/64 + endianness)
+    // The payload: by its segment or section on little-endian ELF64 (where
+    // --clean works too), by the section name elsewhere.
     BunSection bun;
-    bool found = isElf32(fileContents)
-        ? findBunSection<ElfFile32>(fileContents, bun)
-        : findBunSection<ElfFile64>(fileContents, bun);
-    if (!found) {
-        fprintf(stderr, ".bun section not found\n"); return 1;
+    bool found;
+    if (isElf32(fileContents) || fileContents->size() <= EI_DATA || (*fileContents)[EI_DATA] != ELFDATA2LSB) {
+        found = isElf32(fileContents)
+            ? findBunSection<ElfFile32>(fileContents, bun)
+            : findBunSection<ElfFile64>(fileContents, bun);
+        if (!found) {
+            fprintf(stderr, ".bun section not found\n"); return 1;
+        }
+    } else {
+        elf64::Image image(fileContents);
+        elf64::Payload payload;
+        std::string error;
+        if (!image.parse(error) || !elf64::locatePayload(image, payload, error)) {
+            fprintf(stderr, "%s\n", error.c_str()); return 1;
+        }
+        bun.file_offset = payload.file_offset;
+        bun.size = 8 + payload.length;
+        printf("payload layout: %s%s%s\n",
+               payload.layout == elf64::Layout::Segment ? "segment (PT_BUN_PAYLOAD)" : "section (in the writable PT_LOAD)",
+               payload.section < 0 ? ", no .bun header" : "",
+               payload.aot ? ", ahead-of-time compiled code" : "");
+        if (payload.aot && extract) {
+            fprintf(stderr, "--extract: the payload holds ahead-of-time compiled code, not source to extract\n");
+            return 1;
+        }
     }
     printf(".bun section: file_offset=0x%zx size=0x%zx (%zu bytes)\n",
            bun.file_offset, bun.size, bun.size);
@@ -813,7 +1248,7 @@ int main(int argc, char** argv) {
                 ++ok;
             }
             // Extract JSC bytecode as sibling .jsc file
-            if (e.has_bytecode) {
+            if (e.has_bytecode && !no_bytecode) {
                 std::string jsc_path = full + ".jsc";
                 size_t bcreal = (size_t)e.stored_bytecode_off;
                 if (!write_file(jsc_path, sec + bcreal, e.bytecode_len)) return 1;

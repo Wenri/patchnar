@@ -21,14 +21,15 @@ TESTS = \
 	test-hash-mappings.sh \
 	test-symlink-patching.sh \
 	test-language-detection.sh \
-	test-bun-natives.sh
+	test-bun-natives.sh \
+	test-bun-clean.sh
 
 # Test scripts need to be executable
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
 # Distribute test files
-EXTRA_DIST = $(TESTS) test-helper.sh
+EXTRA_DIST = $(TESTS) test-helper.sh bun-clean-fixture.c
 
 # Clean up test artifacts
 clean-local:
