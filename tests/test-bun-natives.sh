@@ -88,7 +88,7 @@ decoy:
     mov 0x28(%rax), %rcx
     lea -0x1d0(%rbp), %rdi
     call _start
-site:
+${3:-site:
     call clone
     mov -0x120(%rbp), %rax
     mov 0x20(%rax), %rsi
@@ -96,7 +96,7 @@ site:
     mov 0x20(%rax), %rdx
     mov 0x28(%rax), %rcx
     lea -0x1d0(%rbp), %rdi
-    call _start
+    call _start}
     pop %rbp
     ret
 ${2:-}
@@ -121,6 +121,39 @@ if test "$actual" != "$expected"; then
     exit 1
 fi
 
+# Inlined createIfDifferent(path.text) with register-held specifier and path (Claude Code 2.1.323+).
+fixture natives_inlined "" "decoy_inlined:
+    call other
+    mov 0x20(%rbx), %rbx
+    mov 0x20(%r15), %r14
+    mov 0x28(%r15), %r15
+    mov %rbx, %rdi
+    mov %r14, %rsi
+    mov %r15, %rdx
+    call _start
+    lea -0x270(%rbp), %rdi
+site:
+    call clone
+    mov 0x20(%rbx), %rbx
+    mov 0x20(%r15), %r14
+    mov 0x28(%r15), %r15
+    mov %rbx, %rdi
+    mov %r14, %rsi
+    mov %r15, %rdx
+    call _start
+    lea -0x270(%rbp), %rdi"
+expected_inlined=$(printf '{"format": 1, "natives": {"module_bytecode_generator": %s, "cached_bytecode_destructor": %s, "mi_free": %s, "bun_string_to_wtf": %s, "latin1_clone": %s, "bundled_source_clone_call": %s}}' \
+    "$(address natives_inlined emit)" "$(address natives_inlined destroy)" "$(address natives_inlined free)" \
+    "$(address natives_inlined to_wtf)" "$(address natives_inlined clone)" "$(address natives_inlined site)")
+actual_inlined=$("$BUN_GRAPH" natives_inlined --natives)
+if test "$actual_inlined" != "$expected_inlined"; then
+    echo "bun_graph --natives (inlined createIfDifferent) reported" >&2
+    echo "  $actual_inlined" >&2
+    echo "expected" >&2
+    echo "  $expected_inlined" >&2
+    exit 1
+fi
+
 # A second copy of any signature is ambiguous: no report, exit 2, the entry named.
 fixture ambiguous "    .p2align 4
 emit_again:
@@ -131,6 +164,26 @@ status=0
 "$BUN_GRAPH" ambiguous --natives > report 2> errors || status=$?
 if test "$status" != 2 || test -s report || ! grep -q '^module_bytecode_generator: 2 signature matches' errors; then
     echo "an ambiguous signature must fail with status 2 (got $status):" >&2
+    cat report errors >&2
+    exit 1
+fi
+
+fixture ambiguous_clone "    .p2align 4
+site_again:
+    call clone
+    mov 0x20(%rbx), %rbx
+    mov 0x20(%r15), %r14
+    mov 0x28(%r15), %r15
+    mov %rbx, %rdi
+    mov %r14, %rsi
+    mov %r15, %rdx
+    call _start
+    lea -0x270(%rbp), %rdi
+    ret"
+status=0
+"$BUN_GRAPH" ambiguous_clone --natives > report 2> errors || status=$?
+if test "$status" != 2 || test -s report || ! grep -q '^bundled_source_clone_call: 2 loader call sites, not 1' errors; then
+    echo "an ambiguous clone call must fail with status 2 (got $status):" >&2
     cat report errors >&2
     exit 1
 fi

@@ -306,34 +306,65 @@ static bool isLatin1Clone(std::string_view text, size_t function) {
 
 // The already-bundled branch of Bun's module loader builds its ResolvedSource from
 // bun.String.cloneLatin1(contents), then input_specifier.createIfDifferent(path.text):
-//   e8 rel32               call  <clone>
-//   48 8b 85 d32 | 45 d8   mov   rax, [rbp-d]
-//   48 8b 70 20            mov   rsi, [rax+0x20]       (the specifier)
-//   (up to 8 bytes)        mov   rax, [rbp-d]          (the path)
-//   48 8b 50 20 48 8b 48 28 mov  rdx/rcx, path.text
-//   48 8d 7d|bd            lea   rdi, [rbp-d]
+//   e8 rel32                        call  <clone>
+//   (optional mov reg, [rbp-d])
+//   REX.W 8b mod01 20               mov   reg, [spec+0x20]      (the specifier)
+//   (up to 8 bytes)                 mov   reg, [rbp-d]          (the path, when spilled)
+//   REX.W 8b mod01 20 REX.W 8b mod01 28  mov ptr/len, path.text
+//   48 8d 7d|bd ...                 lea   rdi, [rbp-d]          (out-of-line createIfDifferent)
+//     or: 3x (REX.W 89 mod11) e8 rel32 48 8d 7d|bd ...          (inlined createIfDifferent)
 // The same argument setup follows other calls in that function; the site is the one
 // whose callee is a Latin-1 clone.
 struct CloneCall { size_t call; size_t clone; };
+static bool isLoad64Disp8(std::string_view text, size_t at, uint8_t disp, uint8_t* baseOut = nullptr) {
+    if (at + 4 > text.size()) return false;
+    uint8_t rex = byteAt(text, at), modrm = byteAt(text, at + 2);
+    if ((rex != 0x48 && rex != 0x49 && rex != 0x4c && rex != 0x4d) || byteAt(text, at + 1) != 0x8b ||
+        (modrm >> 6) != 1 || (modrm & 7) == 4 || byteAt(text, at + 3) != disp)
+        return false;
+    if (baseOut) *baseOut = static_cast<uint8_t>(((rex & 1) << 3) | (modrm & 7));
+    return true;
+}
+static bool isLeaRdiFrame(std::string_view text, size_t at) {
+    if (at + 4 > text.size() || byteAt(text, at) != 0x48 || byteAt(text, at + 1) != 0x8d) return false;
+    uint8_t modrm = byteAt(text, at + 2);
+    return modrm == 0x7d || (modrm == 0xbd && at + 7 <= text.size());
+}
+static bool isRegMov64(std::string_view text, size_t at) {
+    if (at + 3 > text.size()) return false;
+    uint8_t rex = byteAt(text, at);
+    return (rex == 0x48 || rex == 0x49 || rex == 0x4c || rex == 0x4d) &&
+           byteAt(text, at + 1) == 0x89 && (byteAt(text, at + 2) >> 6) == 3;
+}
 static std::vector<CloneCall> findCloneCalls(std::string_view text) {
-    static const std::string_view path_text("\x48\x8b\x50\x20\x48\x8b\x48\x28\x48\x8d", 10);
-    static const std::string_view specifier("\x48\x8b\x70\x20", 4);
     std::vector<CloneCall> calls;
-    for (size_t at = text.find(path_text); at != std::string_view::npos; at = text.find(path_text, at + 1)) {
-        if (at + path_text.size() >= text.size()) break;
-        uint8_t lea = byteAt(text, at + path_text.size());
-        if (lea != 0x7d && lea != 0xbd) continue;
+    for (size_t at = 0; at + 12 <= text.size(); ++at) {
+        if (byteAt(text, at + 1) != 0x8b || byteAt(text, at + 3) != 0x20 ||
+            byteAt(text, at + 5) != 0x8b || byteAt(text, at + 7) != 0x28)
+            continue;
+        uint8_t base0 = 0, base1 = 0;
+        if (!isLoad64Disp8(text, at, 0x20, &base0) || !isLoad64Disp8(text, at + 4, 0x28, &base1) || base0 != base1)
+            continue;
+        size_t after = at + 8;
+        bool tail = isLeaRdiFrame(text, after) ||
+                    (after + 14 < text.size() && isRegMov64(text, after) && isRegMov64(text, after + 3) &&
+                     isRegMov64(text, after + 6) && byteAt(text, after + 9) == 0xe8 &&
+                     isLeaRdiFrame(text, after + 14));
+        if (!tail) continue;
         for (size_t gap = 0; gap <= 8; ++gap) {
-            if (at < gap + specifier.size() + 4 + 5) break;
-            size_t load = at - gap - specifier.size();
-            if (text.substr(load, specifier.size()) != specifier) continue;
-            for (size_t width : {static_cast<size_t>(7), static_cast<size_t>(4)}) {
+            if (at < gap + 4 + 5) break;
+            size_t load = at - gap - 4;
+            if (!isLoad64Disp8(text, load, 0x20)) continue;
+            for (size_t width : {static_cast<size_t>(0), static_cast<size_t>(7), static_cast<size_t>(4)}) {
                 if (load < width + 5) continue;
-                size_t frame = load - width;
-                if (byteAt(text, frame) != 0x48 || byteAt(text, frame + 1) != 0x8b ||
-                    byteAt(text, frame + 2) != (width == 7 ? 0x85 : 0x45))
-                    continue;
-                size_t call = frame - 5;
+                if (width > 0) {
+                    size_t frame = load - width;
+                    uint8_t rex = byteAt(text, frame), modrm = byteAt(text, frame + 2);
+                    if ((rex != 0x48 && rex != 0x4c) || byteAt(text, frame + 1) != 0x8b ||
+                        (modrm & 0xc7) != (width == 7 ? 0x85 : 0x45))
+                        continue;
+                }
+                size_t call = load - width - 5;
                 if (byteAt(text, call) != 0xe8) continue;
                 int32_t relative;
                 memcpy(&relative, text.data() + call + 1, 4);
