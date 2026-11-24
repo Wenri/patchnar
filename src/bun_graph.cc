@@ -218,10 +218,12 @@ static const NativeSignature NATIVE_SIGNATURES[] = {
     {"module_bytecode_generator",
      "55 48 89 e5 48 83 ec 20 4c 89 c0 41 89 c8 89 d1 0f 28 45 10 0f 11 44 24 08 "
      "4c 89 0c 24 ba 01 00 00 00 49 89 c1 e8 ?? ?? ?? ?? 48 83 c4 20 5d c3"},
-    // JSC::CachedBytecode's destructor.
+    // JSC::CachedBytecode's destructor, up to its first field test.  The jumps that follow
+    // move with its body: Claude Code 2.1.331's extra store turned `jne +0x2d; ...; js +0x78`
+    // into `jne +0x39; ...; js rel32`, so the signature ends before the js.
     {"cached_bytecode_destructor",
-     "55 48 89 e5 41 57 41 56 53 50 48 89 fb 8b 47 64 4c 8b 77 58 48 85 c0 75 2d "
-     "83 7b 60 00 78 78 4d 85 f6"},
+     "55 48 89 e5 41 57 41 56 53 50 48 89 fb 8b 47 64 4c 8b 77 58 48 85 c0 75 ?? "
+     "83 7b 60 00"},
     // mimalloc's mi_free; 49 bytes, since its first 36 also open two sibling functions.
     {"mi_free",
      "55 48 89 e5 48 89 fe 48 8b 05 ?? ?? ?? ?? 48 89 f9 48 c1 e9 1d 48 8b 44 c8 50 89 f1 "
@@ -310,9 +312,11 @@ static bool isLatin1Clone(std::string_view text, size_t function) {
 //   (optional mov reg, [rbp-d])
 //   REX.W 8b mod01 20               mov   reg, [spec+0x20]      (the specifier)
 //   (up to 8 bytes)                 mov   reg, [rbp-d]          (the path, when spilled)
-//   REX.W 8b mod01 20 REX.W 8b mod01 28  mov ptr/len, path.text
+//   REX.W 8b mod01 t REX.W 8b mod01 t+8  mov ptr/len, path.text
 //   48 8d 7d|bd ...                 lea   rdi, [rbp-d]          (out-of-line createIfDifferent)
 //     or: 3x (REX.W 89 mod11) e8 rel32 48 8d 7d|bd ...          (inlined createIfDifferent)
+// path.text is a slice in Zig's auto-laid-out Fs.Path, so its offset t moves with the
+// struct (0x20 through Claude Code 2.1.330, 0x10 in 2.1.331): any 8-aligned t matches.
 // The same argument setup follows other calls in that function; the site is the one
 // whose callee is a Latin-1 clone.
 struct CloneCall { size_t call; size_t clone; };
@@ -339,11 +343,13 @@ static bool isRegMov64(std::string_view text, size_t at) {
 static std::vector<CloneCall> findCloneCalls(std::string_view text) {
     std::vector<CloneCall> calls;
     for (size_t at = 0; at + 12 <= text.size(); ++at) {
-        if (byteAt(text, at + 1) != 0x8b || byteAt(text, at + 3) != 0x20 ||
-            byteAt(text, at + 5) != 0x8b || byteAt(text, at + 7) != 0x28)
+        uint8_t field = byteAt(text, at + 3);
+        if (byteAt(text, at + 1) != 0x8b || field % 8 != 0 || field > 0x70 ||
+            byteAt(text, at + 5) != 0x8b || byteAt(text, at + 7) != field + 8)
             continue;
         uint8_t base0 = 0, base1 = 0;
-        if (!isLoad64Disp8(text, at, 0x20, &base0) || !isLoad64Disp8(text, at + 4, 0x28, &base1) || base0 != base1)
+        if (!isLoad64Disp8(text, at, field, &base0) ||
+            !isLoad64Disp8(text, at + 4, static_cast<uint8_t>(field + 8), &base1) || base0 != base1)
             continue;
         size_t after = at + 8;
         bool tail = isLeaRdiFrame(text, after) ||

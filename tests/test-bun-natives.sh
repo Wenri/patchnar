@@ -3,7 +3,8 @@
 # Code calls, located by instruction signatures that must match exactly once.
 # The fixture assembles each signature, a sibling sharing mi_free's first 36
 # bytes, a bun.String.cloneLatin1-shaped function, the loader's clone call and a
-# decoy with the same argument setup after a call to something else.
+# decoy with the same argument setup after a call to something else.  DESTROY is
+# CachedBytecode's destructor as Claude Code 2.1.316-2.1.330 compiled it.
 set -eu
 
 if test "$(uname -m)" != x86_64 || test "$(uname)" != Linux; then
@@ -19,7 +20,12 @@ workdir=$(mktemp -d "${TMPDIR:-/tmp}/test-workdir-natives-XXXXXX")
 trap 'rm -rf "$workdir"' EXIT HUP INT TERM
 cd "$workdir"
 
-fixture() {  # fixture NAME [EXTRA_ASSEMBLY]
+DESTROY_SHORT_JS="0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xfb,0x8b,0x47,0x64
+    .byte 0x4c,0x8b,0x77,0x58,0x48,0x85,0xc0,0x75,0x2d,0x83,0x7b,0x60,0x00,0x78,0x78,0x4d
+    .byte 0x85,0xf6"
+DESTROY=$DESTROY_SHORT_JS
+
+fixture() {  # fixture NAME [EXTRA_ASSEMBLY] [CLONE_SITE]
     cat > "$1.S" <<EOF
     .text
     .globl _start
@@ -32,9 +38,7 @@ emit:
     .byte 0x00,0x00,0x49,0x89,0xc1,0xe8,0x06,0x00,0x00,0x00,0x48,0x83,0xc4,0x20,0x5d,0xc3
     .p2align 4
 destroy:
-    .byte 0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xfb,0x8b,0x47,0x64
-    .byte 0x4c,0x8b,0x77,0x58,0x48,0x85,0xc0,0x75,0x2d,0x83,0x7b,0x60,0x00,0x78,0x78,0x4d
-    .byte 0x85,0xf6
+    .byte $DESTROY
     .p2align 4
 free:
     .byte 0x55,0x48,0x89,0xe5,0x48,0x89,0xfe,0x48,0x8b,0x05,0x11,0x22,0x33,0x44,0x48,0x89
@@ -151,6 +155,61 @@ if test "$actual_inlined" != "$expected_inlined"; then
     echo "  $actual_inlined" >&2
     echo "expected" >&2
     echo "  $expected_inlined" >&2
+    exit 1
+fi
+
+# Claude Code 2.1.331's loader: the specifier's holder reloaded from the frame, and
+# path.text at Fs.Path+0x10 (its offset in Zig's layout of the struct moves).
+fixture natives_path_text "" "decoy_path_text:
+    call other
+    mov -0x68(%rbp), %rax
+    mov 0x20(%rax), %rbx
+    mov 0x10(%r15), %r14
+    mov 0x18(%r15), %r15
+    mov %rbx, %rdi
+    mov %r14, %rsi
+    mov %r15, %rdx
+    call _start
+    lea -0x130(%rbp), %rdi
+site:
+    call clone
+    mov -0x68(%rbp), %rax
+    mov 0x20(%rax), %rbx
+    mov 0x10(%r15), %r14
+    mov 0x18(%r15), %r15
+    mov %rbx, %rdi
+    mov %r14, %rsi
+    mov %r15, %rdx
+    call _start
+    lea -0x130(%rbp), %rdi"
+expected_path_text=$(printf '{"format": 1, "natives": {"module_bytecode_generator": %s, "cached_bytecode_destructor": %s, "mi_free": %s, "bun_string_to_wtf": %s, "latin1_clone": %s, "bundled_source_clone_call": %s}}' \
+    "$(address natives_path_text emit)" "$(address natives_path_text destroy)" "$(address natives_path_text free)" \
+    "$(address natives_path_text to_wtf)" "$(address natives_path_text clone)" "$(address natives_path_text site)")
+actual_path_text=$("$BUN_GRAPH" natives_path_text --natives)
+if test "$actual_path_text" != "$expected_path_text"; then
+    echo "bun_graph --natives (path.text at +0x10) reported" >&2
+    echo "  $actual_path_text" >&2
+    echo "expected" >&2
+    echo "  $expected_path_text" >&2
+    exit 1
+fi
+
+# Claude Code 2.1.331's destructor: an added store moved both jumps after the
+# first field test (jne +0x39, then js rel32 instead of js +0x78).
+DESTROY="0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x50,0x48,0x89,0xfb,0x8b,0x47,0x64
+    .byte 0x4c,0x8b,0x77,0x58,0x48,0x85,0xc0,0x75,0x39,0x83,0x7b,0x60,0x00,0x0f,0x88,0x80
+    .byte 0x00,0x00,0x00,0x4d,0x85,0xf6"
+fixture natives_near_js
+DESTROY=$DESTROY_SHORT_JS
+expected_near_js=$(printf '{"format": 1, "natives": {"module_bytecode_generator": %s, "cached_bytecode_destructor": %s, "mi_free": %s, "bun_string_to_wtf": %s, "latin1_clone": %s, "bundled_source_clone_call": %s}}' \
+    "$(address natives_near_js emit)" "$(address natives_near_js destroy)" "$(address natives_near_js free)" \
+    "$(address natives_near_js to_wtf)" "$(address natives_near_js clone)" "$(address natives_near_js site)")
+actual_near_js=$("$BUN_GRAPH" natives_near_js --natives)
+if test "$actual_near_js" != "$expected_near_js"; then
+    echo "bun_graph --natives (2.1.331 destructor jumps) reported" >&2
+    echo "  $actual_near_js" >&2
+    echo "expected" >&2
+    echo "  $expected_near_js" >&2
     exit 1
 fi
 
